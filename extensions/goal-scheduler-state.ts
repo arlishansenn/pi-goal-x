@@ -6,6 +6,12 @@ export interface GoalWait {
 	token: string;
 	reason: string;
 	deadline: number;
+	/**
+	 * Set only on a wait the runtime raised for a detected background task. It
+	 * marks the wait as system-managed: it does not put the goal under the
+	 * explicit execution contract, and it is dropped once the goal continues.
+	 */
+	taskId?: string;
 	intervalMs?: number;
 	remainingChecks?: number;
 	nextCheckAt?: number;
@@ -46,6 +52,7 @@ export function normalizeGoalScheduler(raw: unknown): GoalSchedulerState | undef
 	if (s.wait) {
 		const w = s.wait;
 		if (!text(w.id) || !text(w.token) || !text(w.reason) || (!integer(w.deadline) || w.deadline > 8_640_000_000_000_000)) return invalid();
+		if (w.taskId !== undefined && !text(w.taskId)) return invalid();
 		if (w.intervalMs !== undefined && (!integer(w.intervalMs) || w.intervalMs < 1000 || !integer(w.remainingChecks) || !integer(w.nextCheckAt))) return invalid();
 		if (w.intervalMs === undefined && (w.remainingChecks !== undefined || w.nextCheckAt !== undefined)) return invalid();
 		if (w.signalled !== undefined && typeof w.signalled !== "boolean") return invalid();
@@ -70,10 +77,15 @@ export function schedulerSummaryParts(s: GoalSchedulerState | undefined, limit?:
 	// empty rather than rendered as "used/unlimited". A finite allowance is
 	// reported unless showAutonomousRuns is off. Enforcement reads the limit
 	// elsewhere; this is display only.
-	const runs = limit !== undefined && showRuns ? `Autonomous runs: ${s?.used ?? 0}/${limit}${limit === 0 ? " (automatic continuation disabled)" : ""}.` : "";
+	// A wait raised for a detected background task rides on the runs line instead
+	// of adding its own rows: the widget's height latches per regime, and a system
+	// task wait is not a regime change, so extra rows would be head-sliced away.
+	const taskWait = s?.wait && s.wait.taskId !== undefined ? s.wait : undefined;
+	const runsLine = limit !== undefined && showRuns ? `Autonomous runs: ${s?.used ?? 0}/${limit}${limit === 0 ? " (automatic continuation disabled)" : ""}.` : "";
+	const runs = (runsLine ? runsLine + " " : "") + (taskWait ? `${taskWait.reason}${taskWait.nextCheckAt !== undefined ? ` Next check ${new Date(taskWait.nextCheckAt).toISOString()}.` : ""}` : "");
 	const lines: string[] = [];
 	if (s) {
-		if (s.wait) {
+		if (s.wait && !taskWait) {
 			lines.push(`Waiting: ${s.wait.reason}; wait_id=${s.wait.id}; deadline=${new Date(s.wait.deadline).toISOString()}.`);
 			if (s.wait.nextCheckAt !== undefined) lines.push(`Next check: ${new Date(s.wait.nextCheckAt).toISOString()}; ${s.wait.remainingChecks} checks remaining.`);
 		}
