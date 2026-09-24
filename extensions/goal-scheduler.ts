@@ -50,13 +50,10 @@ export class GoalScheduler {
 	}
 	private implicitReady(s: GoalSchedulerState): void {
 		s.phase = "ready"; s.dispatch = undefined; s.generation = randomUUID();
-	private implicitReady(s: GoalSchedulerState): void {
-		s.phase = "ready"; s.dispatch = undefined; s.generation = randomUUID();
 		// A task wait ends with the task: the result is the context for the next run.
 		if (s.wait?.taskId !== undefined) s.wait = undefined;
 		s.postTaskProgress = false;
 		s.decision = { kind: "ready", purpose: "ready" };
-	}
 	}
 	private available(ctx: ExtensionContext, s: GoalSchedulerState): boolean {
 		const limit = this.limit(ctx);

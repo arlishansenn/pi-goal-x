@@ -155,7 +155,9 @@ test("a task wait adds no scheduling rows", async t => {
 	// The widget's height latches per regime and a wait is not a regime change,
 	// so a row added here is head-sliced away and takes the box footer with it.
 	assert.doesNotMatch(summary, /\n/, "a task wait must not add scheduling rows");
-	assert.match(summary, /Autonomous runs: 0\/unlimited\./, "the runs line stays the first clause");
+	// 0.32.x dropped the unlimited-allowance runs line, so with no limit there
+	// is no "Autonomous runs" clause for the wait to ride; it stands alone.
+	assert.doesNotMatch(summary, /Autonomous runs/, "no runs clause without a finite allowance");
 	assert.match(summary, /Waiting for pwsh task t1 to finish/);
 	assert.match(summary, /Next check \d{4}-/);
 });
