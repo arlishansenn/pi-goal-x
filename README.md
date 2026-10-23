@@ -20,7 +20,7 @@ The extension saves goal objectives, tasks, and progress across sessions. You ca
 ## Install
 
 ```bash
-pi install npm:pi-goal-x
+pi install git:github.com/arlishansenn/pi-goal-x
 ```
 
 ## Create a goal
