@@ -285,7 +285,7 @@ test("a declared ready decision keeps the goal working while a task runs", async
 	await h.result(h.running("t1"));
 	// Independent work remains, so the agent keeps the goal running rather than
 	// sleeping on the task. The declaration must win over the detected task.
-	assert.equal(h.core.scheduler.declare(h.ctx, { kind: "ready", next_action: "Write the independent report while the task runs." }).terminate, true);
+	assert.equal(h.core.scheduler.declare(h.ctx, { kind: "ready" }).terminate, true);
 	h.core.scheduler.settled(h.ctx);
 	t.mock.timers.tick(1);
 	assert.equal(h.core.state.goal?.scheduler?.wait, undefined, "no task wait may be raised");
@@ -306,11 +306,10 @@ test("a settle after post-detection work defers the task wait", async t => {
 	assert.equal(h.core.state.goal?.scheduler?.phase, "ready");
 	t.mock.timers.tick(1);
 	assert.equal(h.sent.length, 1, "exactly one continuation is dispatched");
+	// 0.32.x removed decision.nextAction: the deferral steering rides the
+	// injected goal context instead, so only the ready decision is asserted here.
 	const decision = h.core.state.goal?.scheduler?.decision;
 	assert.equal(decision?.kind, "ready");
-	const nextAction = decision?.kind === "ready" ? decision.nextAction : "";
-	assert.match(nextAction, /PI GOAL DEFERRING ON BACKGROUND TASK/);
-	assert.match(nextAction, /does not depend on that task's result/);
 });
 
 test("a following settle without new work raises the task wait", async t => {

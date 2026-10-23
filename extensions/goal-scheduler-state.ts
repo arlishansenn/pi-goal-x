@@ -17,6 +17,8 @@ export interface GoalWait {
 	nextCheckAt?: number;
 	signalled?: boolean;
 }
+import { normalizeBackgroundTasks, type BackgroundTasksState } from "./goal-background-registry.ts";
+
 export interface GoalSchedulerState {
 	version: 1;
 	owner: string;
@@ -34,6 +36,8 @@ export interface GoalSchedulerState {
 	 * and after settlement consumes it.
 	 */
 	postTaskProgress?: boolean;
+	/** Durable producer-qualified background task set (local fork adaptation). */
+	backgroundTasks?: BackgroundTasksState;
 }
 export type GoalContinuation =
 	| { kind: "ready" }
@@ -53,6 +57,7 @@ export function normalizeGoalScheduler(raw: unknown): GoalSchedulerState | undef
 	const text = (v: unknown) => typeof v === "string" && v.length > 0 && v.length <= 2000;
 	if (s.version !== 1 || !text(s.owner) || !text(s.generation) || !integer(s.used) || typeof s.repairUsed !== "boolean" || !["idle", "ready", "waiting", "claimed", "running", "interrupted"].includes(s.phase)) return invalid();
 	if (s.postTaskProgress !== undefined && typeof s.postTaskProgress !== "boolean") return invalid();
+	if (s.backgroundTasks !== undefined && normalizeBackgroundTasks(s.backgroundTasks) === "invalid") return invalid();
 	// Goals saved before next actions were removed still carry decision.nextAction.
 	// The field is stripped after validation and never makes a goal invalid:
 	// rejecting one would strand it as interrupted with spent allowance.
