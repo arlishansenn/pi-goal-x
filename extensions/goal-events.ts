@@ -28,6 +28,7 @@ import {
 	goalPromptParts,
 	backgroundTaskNotice,
 	backgroundTaskWaitPrompt,
+	backgroundTaskDeferralPrompt,
 	staleContinuationPrompt,
 	unfocusedOpenGoalsPrompt,
 	untrustedObjectiveBlock,
@@ -487,6 +488,10 @@ export function registerGoalEvents(core: GoalCore): void {
 		const taskWait = activeGoal.scheduler?.phase === "waiting" ? activeGoal.scheduler.wait : undefined;
 		if (taskWait?.taskId !== undefined) {
 			state += `\n\n${backgroundTaskWaitPrompt({ taskId: taskWait.taskId, reason: taskWait.reason })}`;
+		} else if (core.scheduler.pendingBackgroundTasks().length > 0 && activeGoal.scheduler?.phase !== "waiting") {
+			// 0.32.x decisions carry no next action: the deferral steering rides
+			// the standing context while tracked work keeps the goal running.
+			state += `\n\n${backgroundTaskDeferralPrompt(core.scheduler.pendingBackgroundTasks()[0]!)}`;
 		}
 		// F5: [GOAL STALLED] steering note when the detector fired.
 		const stalledNote = core.checkStall(ctx);

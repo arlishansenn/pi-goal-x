@@ -331,7 +331,7 @@ export function backgroundTaskNotice(task: BackgroundTaskRef): string {
 		"[PI GOAL WAITING ON BACKGROUND TASK]",
 		`${task.label} is still running. The goal now waits for its result instead of polling it, and pi reports that result automatically.`,
 		"Do not wait on or poll this task again.",
-		"Finish anything in this turn that does not depend on that result. If work remains for a later turn, keep the goal running with update_goal({ continuation: { kind: \"ready\", next_action: \"<what remains>\" } }). Otherwise end this turn with a one-line status; the goal wakes when the result arrives.",
+		"Finish anything in this turn that does not depend on that result. If work remains for a later turn, keep the goal running with update_goal({ continuation: { kind: \"ready\" } }). Otherwise end this turn with a one-line status; the goal wakes when the result arrives.",
 	].join("\n");
 }
 
@@ -344,7 +344,7 @@ export function backgroundTaskWaitPrompt(wait: { taskId: string; reason: string 
 	return [
 		`[PI GOAL WAITING ON BACKGROUND TASK taskId=${wait.taskId}]`,
 		`${wait.reason} The goal waits for that result; do not poll it.`,
-		"If this turn carries the result or is the scheduled re-check, inspect the result and continue the goal. If work remains that does not depend on the result, do it and declare it with update_goal({ continuation: { kind: \"ready\", next_action: \"<what remains>\" } }) so the goal keeps running. Otherwise end the turn with a one-line status.",
+		"If this turn carries the result or is the scheduled re-check, inspect the result and continue the goal. If work remains that does not depend on the result, do it and declare it with update_goal({ continuation: { kind: \"ready\" } }) so the goal keeps running. Otherwise end the turn with a one-line status.",
 	].join("\n");
 }
 
