@@ -125,6 +125,17 @@ Open `/goal-settings` to change these options. You can save defaults for all pro
 | Auditor disabled | Turn off independent completion review. |
 | Auditor provider, model, and thinking level | Choose which model reviews completed work and its reasoning effort. |
 
+## Developer verification
+
+Two project skills verify the lifecycle's critical paths with the TLC model checker. After editing the covered files, run the matching command (Java 17+; the first run downloads tla2tools 1.7.4):
+
+```bash
+node .agents/skills/goal-flush-transaction/run-tlc.mjs
+node .agents/skills/goal-completion-audit/run-tlc.mjs
+```
+
+`goal-flush-transaction` model-checks the `GoalService` per-turn transaction (turn buffer, flush, revision conflicts, external writers). `goal-completion-audit` model-checks the completion flow (auditor verdicts, focus tokens, deferred archival). Each skill's `SKILL.md` records its coverage and how to read a counterexample.
+
 ## License
 
 MIT
