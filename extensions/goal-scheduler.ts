@@ -10,7 +10,6 @@ import {
 	outstandingTasks, projectWait, type BackgroundTasksState,
 } from "./goal-background-registry.ts";
 import { isPendingTaskPoll, observeBackgroundTask, type BackgroundTaskRef, type TaskResultLike } from "./goal-background-task.ts";
-import { backgroundTaskDeferralPrompt } from "./prompts/goal-prompts.ts";
 import { CORE_GOAL_TOOL_NAMES } from "./goal-tool-names.ts";
 
 /** Goal bookkeeping results describe the goal; they are never deferring work. */
@@ -40,6 +39,7 @@ export class GoalScheduler {
 	private postTaskProgress = false;
 	private denied = false;
 	private unsubscribe: (() => void) | undefined;
+	private unsubscribeLifecycle: (() => void) | undefined;
 	private core: GoalCore;
 	constructor(core: GoalCore) { this.core = core; }
 
@@ -115,16 +115,22 @@ export class GoalScheduler {
 		return this.limit(ctx) === 0 ? "Automatic continuation disabled by maxAutonomousRuns=0. Change the setting in /goal-settings, then use /goal-resume." : "Autonomous-run allowance exhausted. Increase or remove maxAutonomousRuns, or use /goal-resume to renew.";
 	}
 
-	/** Bind once per live session. The event is deliberately not a triggerTurn message. */
+	/** Bind once per live session. The events are deliberately not triggerTurn messages. */
 	attach(ctx: ExtensionContext): void {
 		this.ctx = ctx;
 		this.unsubscribe?.();
+		this.unsubscribeLifecycle?.();
 		this.unsubscribe = this.core.pi.events?.on("pi-goal:wake", (event: unknown) => {
 			const raw = asRecord(event);
 			if (raw && this.ctx) this.signal(this.ctx, raw.goalId, raw.waitToken);
 		});
+		// Terminal evidence from the workflow lifecycle bus: correlation only, the
+		// native workflow-result host message still owns wakeup and delivery.
+		this.unsubscribeLifecycle = this.core.pi.events?.on("pi-dynamic-workflows:lifecycle", (event: unknown) => {
+			this.noteTaskLifecycle(event);
+		});
 	}
-	shutdown(): void { this.cancelTimer(); this.unsubscribe?.(); this.unsubscribe = undefined; this.ctx = undefined; this.tasks = undefined; this.postTaskProgress = false; }
+	shutdown(): void { this.cancelTimer(); this.unsubscribe?.(); this.unsubscribeLifecycle?.(); this.unsubscribe = undefined; this.ctx = undefined; this.tasks = undefined; this.postTaskProgress = false; }
 
 	/**
 	 * Read a tool result for detached work through the producer registry. The
