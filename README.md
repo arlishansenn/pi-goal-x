@@ -120,7 +120,7 @@ Open `/goal-settings` to change these options. You can save defaults for all pro
 
 ## Developer verification
 
-Two project skills verify the lifecycle's critical paths with the TLC model checker. After editing the covered files, run the matching command (Java 17+; the first run downloads tla2tools 1.7.4):
+Two project skills model-check the lifecycle's critical paths with the TLC model checker (Java 17+; the first run downloads tla2tools 1.7.4). After editing the covered files, run the matching command:
 
 ```bash
 node .agents/skills/goal-flush-transaction/run-tlc.mjs
@@ -128,6 +128,12 @@ node .agents/skills/goal-completion-audit/run-tlc.mjs
 ```
 
 `goal-flush-transaction` model-checks the `GoalService` per-turn transaction (turn buffer, flush, revision conflicts, external writers). `goal-completion-audit` model-checks the completion flow (auditor verdicts, focus tokens, deferred archival). Each skill's `SKILL.md` records its coverage and how to read a counterexample.
+
+`verify-pi-goal-x` drives the real app instead: it launches pi in RPC mode with only this extension loaded, exercises `/goal` commands the way a user would, and captures the RPC transcript plus `.pi/goals/` snapshots as evidence. Start with its doctor:
+
+```bash
+node .agents/skills/verify-pi-goal-x/rpc-drive.mjs doctor /tmp/pgx-doctor-evidence
+```
 
 ## License
 
