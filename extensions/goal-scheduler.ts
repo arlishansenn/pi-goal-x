@@ -6,7 +6,7 @@ import { budgetReached } from "./goal-accounting.ts";
 import { loadGoalSettings, invalidateGoalSettingsCache } from "./goal-settings.ts";
 import { newGoalScheduler, schedulerSummary, type GoalContinuation, type GoalSchedulerState } from "./goal-scheduler-state.ts";
 import {
-	allocateWaits, consumeDueChecks, isTaskPoll, observeHostMessage, observeLifecycle, observeToolResult,
+	allocateWaits, consumeDueChecks, isTaskPoll, observeHostMessage, observeToolResult,
 	outstandingTasks, projectWait, type BackgroundTasksState,
 } from "./goal-background-registry.ts";
 import { type BackgroundTaskRef, type TaskResultLike } from "./goal-background-task.ts";
@@ -23,9 +23,6 @@ const BOOKKEEPING_TOOL_NAMES = new Set<string>(CORE_GOAL_TOOL_NAMES);
  */
 export const BACKGROUND_TASK_WAIT_MS = 10 * 60_000;
 
-/** Slack over the re-check interval so the check dispatch always wins over the deadline pause. */
-const BACKGROUND_TASK_DEADLINE_MARGIN_MS = 60_000;
-
 /** Scheduling intent is durable; timers only arrange an opportunity to claim it. */
 export class GoalScheduler {
 	private timer: ReturnType<typeof setTimeout> | undefined;
@@ -38,7 +35,6 @@ export class GoalScheduler {
 	private failures = new Map<string, string>();
 	private toolScopes = new Map<string, { goalId: string | null; owner: string }>();
 	private unsubscribe: (() => void) | undefined;
-	private unsubscribeLifecycle: (() => void) | undefined;
 	private core: GoalCore;
 	constructor(core: GoalCore) { this.core = core; }
 
@@ -191,18 +187,12 @@ export class GoalScheduler {
 	attach(ctx: ExtensionContext): void {
 		this.ctx = ctx;
 		this.unsubscribe?.();
-		this.unsubscribeLifecycle?.();
 		this.unsubscribe = this.core.pi.events?.on("pi-goal:wake", (event: unknown) => {
 			const raw = asRecord(event);
 			if (raw && this.ctx) this.signal(this.ctx, raw.goalId, raw.waitToken);
 		});
-		// Terminal evidence from the workflow lifecycle bus: correlation only, the
-		// native workflow-result host message still owns wakeup and delivery.
-		this.unsubscribeLifecycle = this.core.pi.events?.on("pi-dynamic-workflows:lifecycle", (event: unknown) => {
-			if (this.ctx) this.noteTaskLifecycle(this.ctx, event);
-		});
 	}
-	shutdown(): void { this.cancelTimer(); this.unsubscribe?.(); this.unsubscribeLifecycle?.(); this.unsubscribe = undefined; this.ctx = undefined; this.toolScopes.clear(); }
+	shutdown(): void { this.cancelTimer(); this.unsubscribe?.(); this.unsubscribe = undefined; this.ctx = undefined; this.toolScopes.clear(); }
 
 	noteToolResult(ctx: ExtensionContext, event: TaskResultLike & { toolCallId?: string }): BackgroundTaskRef | null {
 		const origin = event.toolCallId ? this.toolScopes.get(event.toolCallId) : undefined;
@@ -235,15 +225,6 @@ export class GoalScheduler {
 			launched = observedLaunch;
 		});
 		return launched;
-	}
-
-	/** A producer lifecycle bus event is evidence, not host delivery. */
-	noteTaskLifecycle(ctx: ExtensionContext, payload: unknown): void {
-		if (!this.background(ctx)) return;
-		this.safe(ctx, () => this.changeBackground(ctx, s => {
-			const result = observeLifecycle(s.backgroundTasks, payload, this.owner(ctx));
-			if (result.changed) s.backgroundTasks = result.state;
-		}));
 	}
 
 	/** Whether settlement would defer for a detected task: an active auto-continue goal. */

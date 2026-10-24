@@ -72,10 +72,6 @@ export async function extensionFixture({ cwd: existing, owner = OWNER, hasUI = f
 		result: receipt => event("tool_result", receipt),
 		message: message => event("message_start", { message }),
 		call: (toolName, input) => event("tool_call", { type: "tool_call", toolCallId: "poll", toolName, input }),
-		lifecycle: payload => {
-			assert.ok(listeners.has("pi-dynamic-workflows:lifecycle"), "workflow lifecycle subscription");
-			return listeners.get("pi-dynamic-workflows:lifecycle")(payload);
-		},
 		close: async () => {
 			await event("session_shutdown");
 			if (!existing) rmSync(cwd, { recursive: true, force: true });
@@ -89,30 +85,19 @@ export async function extensionFixture({ cwd: existing, owner = OWNER, hasUI = f
 
 const text = value => [{ type: "text", text: value }];
 export const producers = {
-	workflow: {
-		launch: (id, receipt = `launch-${id}`) => ({ toolName: "workflow", toolCallId: receipt, input: { background: true }, isError: false, details: { runId: id, background: true }, structuredContent: { runId: id, status: "started" }, content: text("Background workflow started.") }),
-		resume: (id, receipt = `resume-${id}`) => ({ toolName: "workflow", toolCallId: receipt, input: { resume: id }, isError: false, details: { runId: id, background: true, resumedFrom: id }, structuredContent: { runId: id, status: "resumed" }, content: text("Background workflow resumed.") }),
-		host: deliveryId => ({ role: "custom", customType: "workflow-result", details: { deliveryId }, content: "Detached work finished." }),
-		poll: id => ["workflow_status", { runId: id }],
-	},
 	subagent: {
 		launch: (id, receipt = `launch-${id}`) => ({ toolName: "subagent", toolCallId: receipt, input: { agent: "delegate", task: "Report a result", async: true }, isError: false, details: { mode: "single", runId: id, toolCallId: receipt, results: [], asyncId: id, asyncDir: `/tmp/async-subagent-runs/${id}`, context: "fresh", timeoutMs: 1800000 }, content: text(`Async: delegate [${id}]`) }),
 		host: (id, status = "completed") => ({ role: "custom", customType: "subagent-notify", details: { runs: [{ agent: "delegate", runId: id, status, asyncDir: `/tmp/async-subagent-runs/${id}`, durationMs: 1000 }] }, content: "Detached work finished." }),
 		poll: id => ["subagent", { action: "status", id }],
 	},
-	generic: {
+	background: {
 		launch: id => ({ toolName: "bg_run", toolCallId: `launch-${id}`, input: { command: "sleep" }, isError: false, details: { task: { id, name: "detached work", status: "running" } }, content: text("running") }),
 		poll: id => ["bg_status", { id }],
 	},
+	generic: {
+		launch: id => ({ toolName: "pwsh", toolCallId: `launch-${id}`, input: { command: "sleep" }, isError: false, details: { taskId: id, phase: "running" }, content: text("running") }),
+		poll: id => ["pwsh", { taskId: id }],
+	},
 };
 
-export const lifecycle = (runId, status, sessionId = OWNER) => ({ runId, status, sessionId, name: "detached work" });
 export const work = { toolName: "read", toolCallId: "independent-read", input: { file_path: "independent.txt" }, isError: false, content: [{ type: "text", text: "independent result" }] };
-
-export const workflowIdentity = (runId, executionEpoch = 1, sessionId = OWNER) => ({ contractVersion: 1, runId, executionEpoch, originSessionId: sessionId, sessionId });
-export const workflowV1 = {
- launch: (id, receipt = `launch-${id}`) => ({ ...producers.workflow.launch(id, receipt), details: { ...workflowIdentity(id), background: true } }),
- resume: (id, epoch = 2, receipt = `resume-${id}-${epoch}`) => ({ ...producers.workflow.resume(id, receipt), details: { ...workflowIdentity(id, epoch), background: true, resumedFrom: id } }),
- host: (id, deliveryId, epoch = 1) => ({ ...producers.workflow.host(deliveryId), details: { ...workflowIdentity(id, epoch), deliveryId } }),
- lifecycle: (id, status, epoch = 1) => ({ ...workflowIdentity(id, epoch), name: "detached work", status }),
-};

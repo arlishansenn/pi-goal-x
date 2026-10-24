@@ -17,7 +17,7 @@ export interface GoalWait {
 	nextCheckAt?: number;
 	signalled?: boolean;
 }
-import { normalizeBackgroundTasks, type BackgroundTasksState } from "./goal-background-registry.ts";
+import { normalizeBackgroundTasks, projectWait, type BackgroundTasksState } from "./goal-background-registry.ts";
 
 export interface GoalSchedulerState {
 	version: 1;
@@ -86,6 +86,12 @@ export function normalizeGoalScheduler(raw: unknown, goalId?: string): GoalSched
 	if (s.phase === "waiting" && (!s.wait || s.decision?.kind !== "wait")) return invalid();
 	const normalized = structuredClone(s) as GoalSchedulerState;
 	if (s.backgroundTasks !== undefined) normalized.backgroundTasks = structuredClone(backgroundTasks);
+	if (normalized.wait?.taskId !== undefined && backgroundTasks && s.backgroundTasks && backgroundTasks.tasks.length < s.backgroundTasks.tasks.length) {
+		// Retired identities lose their check opportunities, not the standing deadline.
+		const projection = projectWait(backgroundTasks);
+		normalized.wait.remainingChecks = projection?.remainingChecks ?? 0;
+		normalized.wait.nextCheckAt = projection?.nextCheckAt;
+	}
 	if (normalized.wait?.remainingChecks === 0) delete normalized.wait.nextCheckAt;
 	if (normalized.backgroundTasks && goalId) {
 		const scope = normalized.backgroundTasks.scope;

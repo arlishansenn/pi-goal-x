@@ -1,28 +1,19 @@
 import { asRecord } from "./goal-record.ts";
 import { observeBackgroundTask, type TaskResultLike } from "./goal-background-task.ts";
 
-export type ProducerId =
+type ProducerId =
 	| "nicobailon/pi-subagents"
-	| "@quintinshaw/pi-dynamic-workflows"
 	| "ismailsaleekh/pi-background-tasks"
 	| `structured:${string}`;
 
 /** Terminal evidence about external work; not a goal lifecycle status. */
-export type TaskOutcome = "completed" | "failed" | "paused" | "stopped";
+type TaskOutcome = "completed" | "failed" | "paused" | "stopped";
 
 /** Untrusted ids stay bounded; presentation labels stay short. */
 const MAX_ID_CHARS = 200;
 
-export interface WorkflowIdentity {
-	contractVersion: 1;
-	executionEpoch: number;
-	originSessionId?: string;
-}
-
 export interface TrackedTask {
 	scope?: { goalId: string; sessionId: string };
-	execution?: WorkflowIdentity;
-	superseded?: true;
 	producer: ProducerId;
 	/** Producer task id; empty for an anonymous generic observation. */
 	taskId: string;
@@ -32,8 +23,6 @@ export interface TrackedTask {
 	toolName: string;
 	/** Launch receipt occurrence (toolCallId) for idempotent re-observation. */
 	receiptId: string;
-	/** Legacy resumes cannot accept unversioned terminal events from an older execution. */
-	legacyResumed?: true;
 	/** Terminal evidence; absent means running. */
 	outcome?: TaskOutcome;
 	/** The producer's native host report was observed for this task. */
@@ -46,34 +35,15 @@ export interface BackgroundTasksState {
 	version: 1;
 	scope?: { goalId: string; sessionId: string };
 	tasks: readonly TrackedTask[];
-	deliveries?: readonly { deliveryId: string; runId: string; executionEpoch: number }[];
 }
 
 export const BACKGROUND_TASK_WAIT_MS = 10 * 60_000;
-export const BACKGROUND_TASK_DEADLINE_MARGIN_MS = 60_000;
+const BACKGROUND_TASK_DEADLINE_MARGIN_MS = 60_000;
 
 const NICO_MODES = new Set(["single", "parallel", "chain", "workflow"]);
 
 function boundedId(value: unknown): string {
 	return typeof value === "string" && value.trim() ? value.trim().slice(0, MAX_ID_CHARS) : "";
-}
-
-const DW = "@quintinshaw/pi-dynamic-workflows";
-
-function workflowIdentity(value: Record<string, unknown>): WorkflowIdentity | undefined {
-	if (value.contractVersion !== 1 || !Number.isSafeInteger(value.executionEpoch) || Number(value.executionEpoch) <= 0) return undefined;
-	if (value.originSessionId !== undefined && (typeof value.originSessionId !== "string" || !value.originSessionId.trim() || value.originSessionId.length > MAX_ID_CHARS)) return undefined;
-	if (typeof value.runId !== "string" || !value.runId.trim() || value.runId.length > MAX_ID_CHARS) return undefined;
-	return { contractVersion: 1, executionEpoch: Number(value.executionEpoch), ...(typeof value.originSessionId === "string" ? { originSessionId: value.originSessionId } : {}) };
-}
-
-function workflowMatches(task: TrackedTask, value: Record<string, unknown>, scope: BackgroundTasksState["scope"]): boolean {
-	const execution = workflowIdentity(value);
-	return !!scope && !!execution && task.producer === DW && task.taskId === value.runId
-		&& task.execution?.executionEpoch === execution.executionEpoch
-		&& task.execution.originSessionId === execution.originSessionId
-		&& (value.sessionId === undefined || value.sessionId === scope.sessionId)
-		&& (execution.originSessionId === undefined || execution.originSessionId === scope.sessionId);
 }
 
 /** Launch adapters: only verified structural shapes enroll a running task. */
@@ -94,14 +64,6 @@ function producerLaunch(event: TaskResultLike & { toolCallId?: string }): Tracke
 		const runId = boundedId(details.runId);
 		return { producer: "nicobailon/pi-subagents", taskId: asyncId, aliases: runId && runId !== asyncId ? [runId] : [],
 			label: `pi-subagents task ${asyncId}`, toolName: event.toolName, receiptId, hostReported: false };
-	}
-	if (event.toolName === "workflow") {
-		// dynamic workflows: host details flag a background run; content prose
-		// is never parsed and a foreground run does not enroll.
-		const runId = boundedId(details.runId);
-		if (details.background !== true || !runId) return null;
-		return { producer: "@quintinshaw/pi-dynamic-workflows", taskId: runId, aliases: [],
-			label: `workflow ${runId}`, toolName: event.toolName, receiptId, hostReported: false };
 	}
 	return null;
 }
@@ -129,12 +91,10 @@ function genericObservation(event: TaskResultLike): { launched?: TrackedTask; se
 	return { settled: { taskId: observation.taskId, outcome: outcomeOf(observation.status) ?? "completed" } };
 }
 
-export interface ToolResultObservation {
+interface ToolResultObservation {
 	state: BackgroundTasksState;
 	/** A newly enrolled task, for the launch notice. */
 	launched?: TrackedTask;
-	/** Terminal evidence observed in this result (generic lifecycle path). */
-	settled?: { identity: { producer: ProducerId; taskId: string }; outcome?: TaskOutcome };
 	/** True when the result itself was a background-task observation: like PR #83, it never counts as progress. */
 	observed: boolean;
 }
@@ -154,19 +114,6 @@ export function observeToolResult(
 	const owns = (t: TrackedTask) => (t.scope ?? current?.scope)?.sessionId === sessionId;
 	const details = asRecord(event.details);
 	if (details?.sessionId !== undefined && details.sessionId !== sessionId) return { state: state(), observed: true };
-	if (event.toolName === "workflow_control" && details?.action === "resume" && details.result === "resumed" && !event.isError) {
-		const run = asRecord(details.run);
-		const runId = boundedId(run?.runId);
-		const existing = tasks.find(t => owns(t) && t.producer === "@quintinshaw/pi-dynamic-workflows" && t.taskId === runId);
-		if (!existing) return { state: state(), observed: true };
-		return observeToolResult(current, { ...event, toolName: "workflow", details: { ...run, background: true, resumedFrom: runId } }, sessionId);
-	}
-	if (event.toolName === "workflow_control") {
-		if (event.isError || details?.result === "error") return { state: state(), observed: true };
-		const runs = Array.isArray(details?.runs) ? details.runs : [details?.run];
-		for (const run of runs) tasks = [...observeLifecycle(state(), run, sessionId).state?.tasks ?? tasks];
-		return { state: state(), observed: true };
-	}
 	if (event.toolName === "bg_status" && Array.isArray(details?.tasks)) {
 		let observed = false;
 		for (const task of details.tasks) {
@@ -176,26 +123,7 @@ export function observeToolResult(
 		}
 		return { state: state(), observed };
 	}
-	if (event.toolName === "workflow" && details) {
-		const versioned = details.contractVersion !== undefined || details.executionEpoch !== undefined || details.originSessionId !== undefined;
-		if (versioned) {
-			const execution = workflowIdentity(details);
-			if (!execution || !current?.scope || (execution.originSessionId !== undefined && execution.originSessionId !== sessionId)) return { state: state(), observed: true };
-			const parsedLaunch = producerLaunch(event);
-			const launch = parsedLaunch ? { ...parsedLaunch, scope: launchScope } : null;
-			if (!launch) return { state: state(), observed: event.isError === true || details.background === true };
-			const previous = tasks.filter(t => owns(t) && t.producer === DW && t.taskId === launch.taskId);
-			if (previous.some(t => workflowMatches(t, details, t.scope ?? current.scope))) return { state: state(), observed: true };
-			const latest = previous.reduce((epoch, t) => Math.max(epoch, t.execution?.executionEpoch ?? 0), 0);
-			if (previous.length && (details.resumedFrom !== launch.taskId || execution.executionEpoch <= latest)) return { state: state(), observed: true };
-			if (!previous.length && details.resumedFrom !== undefined) return { state: state(), observed: true };
-			tasks = tasks.map(t => owns(t) && t.producer === DW && t.taskId === launch.taskId ? { ...t, superseded: true as const } : t);
-			const enrolled = { ...launch, execution };
-			tasks.push(enrolled);
-			return { state: state(), launched: enrolled, observed: true };
-		}
-		if (tasks.some(t => owns(t) && t.producer === DW && t.taskId === details.runId && t.execution)) return { state: state(), observed: true };
-	}
+
 	const parsedLaunch = producerLaunch(event);
 	const launch = parsedLaunch ? { ...parsedLaunch, scope: launchScope } : null;
 	if (launch) {
@@ -203,12 +131,6 @@ export function observeToolResult(
 		if (index < 0) {
 			tasks.push(launch);
 			return { state: state(), launched: launch, observed: true };
-		}
-		const existing = tasks[index]!;
-		if (existing.receiptId !== launch.receiptId && existing.outcome && details?.resumedFrom === launch.taskId) {
-			const resumed: TrackedTask = { ...launch, legacyResumed: true };
-			tasks[index] = resumed;
-			return { state: state(), launched: resumed, observed: true };
 		}
 		return { state: state(), observed: true };
 	}
@@ -218,13 +140,11 @@ export function observeToolResult(
 	if (generic.settled) {
 		const { taskId, outcome } = generic.settled;
 		const producer = structuredProducer(event.toolName);
-		let matched = false;
 		tasks = tasks.map(t => {
 			if (!owns(t) || t.producer !== producer || t.taskId !== taskId || t.hostReported) return t;
-			matched = true;
 			return { ...t, outcome, hostReported: true };
 		});
-		return { state: state(), ...(matched ? { settled: { identity: { producer, taskId }, outcome } } : {}), observed: true };
+		return { state: state(), observed: true };
 	}
 	if (generic.launched) {
 		const launched = { ...generic.launched, scope: launchScope };
@@ -248,17 +168,6 @@ export function observeHostMessage(
 	const details = asRecord(msg.details);
 	if (!details) return { state: current, reported: [] };
 	if (details.sessionId !== undefined && details.sessionId !== sessionId) return { state: current, reported: [] };
-	if (msg.customType === "workflow-result") {
-		const deliveryId = boundedId(details.deliveryId);
-		if (!deliveryId || deliveryId !== details.deliveryId || details.sessionId !== sessionId || !workflowIdentity(details)) return { state: current, reported: [] };
-		const index = current.tasks.findIndex(t => (t.scope ?? current.scope)?.sessionId === sessionId && workflowMatches(t, details, t.scope ?? current.scope));
-		if (index < 0 || current.deliveries?.some(d => d.deliveryId === deliveryId)) return { state: current, reported: [] };
-		const task = current.tasks[index]!;
-		const updated = { ...task, hostReported: true };
-		const tasks = current.tasks.map((t, i) => i === index ? updated : t);
-		const deliveries = [...current.deliveries ?? [], { deliveryId, runId: task.taskId, executionEpoch: task.execution!.executionEpoch }];
-		return { state: { ...current, tasks, deliveries }, reported: task.hostReported || task.superseded ? [] : [updated] };
-	}
 	const reported: TrackedTask[] = [];
 	let tasks = [...current.tasks];
 	const reports = msg.customType === "subagent-notify" && Array.isArray(details.runs) ? details.runs
@@ -278,28 +187,6 @@ export function observeHostMessage(
 		});
 	}
 	return { state: { ...current, tasks }, reported };
-}
-
-/** The subscribed bus belongs to dynamic workflows, not every producer with this ID. */
-export function observeLifecycle(
-	current: BackgroundTasksState | undefined,
-	payload: unknown,
-	sessionId = current?.scope?.sessionId,
-): { state: BackgroundTasksState | undefined; changed: boolean } {
-	if (!current || current.tasks.length === 0) return { state: current, changed: false };
-	const p = asRecord(payload);
-	if (!p || !current.scope || (p.sessionId !== undefined && p.sessionId !== sessionId)) return { state: current, changed: false };
-	const runId = boundedId(p.runId);
-	const outcome = outcomeOf(boundedId(p.status).toLowerCase());
-	if (!runId || !outcome) return { state: current, changed: false };
-	let changed = false;
-	const tasks = current.tasks.map(t => {
-		if ((t.scope ?? current.scope)?.sessionId !== sessionId || t.producer !== DW || t.taskId !== runId || t.outcome || t.legacyResumed) return t;
-		if (t.execution ? !workflowMatches(t, p, t.scope ?? current.scope) : p.contractVersion !== undefined || p.executionEpoch !== undefined || p.originSessionId !== undefined || p.sessionId !== sessionId) return t;
-		changed = true;
-		return { ...t, outcome };
-	});
-	return { state: { ...current, tasks }, changed };
 }
 
 const CONTROL_TOOL = /stop|cancel|kill|terminate|abort|steer|interrupt|retry|resume|delete/i;
@@ -350,7 +237,6 @@ export function isTaskPoll(
 	const outstanding = outstandingTasks(state);
 	const knownProducer: ProducerId | undefined =
 		toolName === "subagent" ? "nicobailon/pi-subagents"
-		: toolName === "workflow" ? "@quintinshaw/pi-dynamic-workflows"
 		: ["bg_run", "bg_status"].includes(toolName) ? "ismailsaleekh/pi-background-tasks"
 		: undefined;
 	let matches = outstanding.filter(t => ids.some(id => id === t.taskId || t.aliases.includes(id)));
@@ -362,21 +248,16 @@ export function isTaskPoll(
 	return matches.length > 0 && producers.size === 1;
 }
 
-/**
- * Tasks the goal still owes a wait for. A task leaves this set when its native
- * report has been observed, whether the report said completed, failed, paused
- * or stopped: terminal lifecycle evidence without a report stays outstanding as
- * a delivery guard until the report or the original deadline.
- */
+/** Tasks still awaiting a native host report or structured terminal result. */
 export function outstandingTasks(state: BackgroundTasksState | undefined): readonly TrackedTask[] {
 	if (!state) return [];
-	return state.tasks.filter(t => !t.hostReported && !t.superseded);
+	return state.tasks.filter(t => !t.hostReported);
 }
 
 /** Give every outstanding task without a budget its one immutable wait window. */
 export function allocateWaits(state: BackgroundTasksState, now: number): BackgroundTasksState {
 	const tasks = state.tasks.map(t =>
-		!t.hostReported && !t.superseded && !t.wait
+		!t.hostReported && !t.wait
 			? { ...t, wait: { deadline: now + BACKGROUND_TASK_WAIT_MS + BACKGROUND_TASK_DEADLINE_MARGIN_MS, checkAt: now + BACKGROUND_TASK_WAIT_MS, remainingChecks: 1 as const } }
 			: t,
 	);
@@ -432,6 +313,7 @@ export function normalizeBackgroundTasks(raw: unknown): BackgroundTasksState | u
 	const tasks: TrackedTask[] = [];
 	for (const item of record.tasks) {
 		const t = asRecord(item);
+		if (t?.producer === "@quintinshaw/pi-dynamic-workflows") continue;
 		if (!t || typeof t.producer !== "string" || !t.producer || typeof t.taskId !== "string" || typeof t.label !== "string" || typeof t.toolName !== "string" || typeof t.receiptId !== "string" || typeof t.hostReported !== "boolean") return "invalid";
 		let taskScope: TrackedTask["scope"];
 		if (t.scope !== undefined) {
@@ -439,14 +321,6 @@ export function normalizeBackgroundTasks(raw: unknown): BackgroundTasksState | u
 			if (!rawScope || typeof rawScope.goalId !== "string" || !rawScope.goalId || typeof rawScope.sessionId !== "string" || !rawScope.sessionId || (scope && rawScope.goalId !== scope.goalId)) return "invalid";
 			taskScope = { goalId: rawScope.goalId, sessionId: rawScope.sessionId };
 		}
-		let execution: WorkflowIdentity | undefined;
-		if (t.execution !== undefined) {
-			const rawExecution = asRecord(t.execution);
-			execution = rawExecution ? workflowIdentity({ ...rawExecution, runId: t.taskId }) : undefined;
-			if (!execution || t.producer !== DW) return "invalid";
-		}
-		if (t.superseded !== undefined && t.superseded !== true) return "invalid";
-		if (t.legacyResumed !== undefined && t.legacyResumed !== true) return "invalid";
 		if (t.outcome !== undefined && !["completed", "failed", "paused", "stopped"].includes(String(t.outcome))) return "invalid";
 		if (t.wait !== undefined) {
 			const w = asRecord(t.wait);
@@ -457,22 +331,10 @@ export function normalizeBackgroundTasks(raw: unknown): BackgroundTasksState | u
 			aliases: Array.isArray(t.aliases) ? t.aliases.map(String) : [],
 			label: t.label, toolName: t.toolName, receiptId: t.receiptId,
 			outcome: t.outcome as TaskOutcome | undefined,
-			...(t.legacyResumed === true ? { legacyResumed: true as const } : {}),
 			...(taskScope ? { scope: taskScope } : {}),
-			...(execution ? { execution } : {}),
-			...(t.superseded === true ? { superseded: true as const } : {}),
 			hostReported: t.hostReported,
 			wait: t.wait as TrackedTask["wait"],
 		});
 	}
-	const deliveries: NonNullable<BackgroundTasksState["deliveries"]>[number][] = [];
-	if (record.deliveries !== undefined) {
-		if (!Array.isArray(record.deliveries)) return "invalid";
-		for (const value of record.deliveries) {
-			const d = asRecord(value);
-			if (!d || !boundedId(d.deliveryId) || boundedId(d.deliveryId) !== d.deliveryId || !boundedId(d.runId) || !Number.isSafeInteger(d.executionEpoch) || Number(d.executionEpoch) <= 0 || deliveries.some(prior => prior.deliveryId === d.deliveryId)) return "invalid";
-			deliveries.push({ deliveryId: String(d.deliveryId), runId: String(d.runId), executionEpoch: Number(d.executionEpoch) });
-		}
-	}
-	return { version: 1, ...(scope ? { scope } : {}), tasks, ...(record.deliveries !== undefined ? { deliveries } : {}) };
+	return { version: 1, ...(scope ? { scope } : {}), tasks };
 }

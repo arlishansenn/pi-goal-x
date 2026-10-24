@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { extensionFixture, producers, workflowV1, OWNER, GOAL_ID } from './issue-828-extension.mjs';
+import { extensionFixture, producers, OWNER, GOAL_ID } from './issue-828-extension.mjs';
 import path from 'node:path';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { parseGoalFile } from '../../extensions/storage/goal-files.ts';
@@ -12,8 +12,8 @@ for (const namespace of ['structured:bg_run', 'structured:bg_status']) {
     const h = await extensionFixture();
     try {
       await h.begin();
-      await h.result(producers.generic.launch('legacy-bg'));
-      await h.result(workflowV1.launch('versioned-sibling'));
+      await h.result(producers.background.launch('legacy-bg'));
+      await h.result(producers.subagent.launch('subagent-sibling'));
       await h.settle();
       const goal = await h.goal();
       const file = path.resolve(h.cwd, goal.activePath);
@@ -24,32 +24,13 @@ for (const namespace of ['structured:bg_run', 'structured:bg_status']) {
       writeFileSync(file, raw.replaceAll('ismailsaleekh/pi-background-tasks', namespace));
       const parsed = parseGoalFile(file);
       assert.equal(parsed.scheduler.backgroundTasks.tasks[0].producer, 'ismailsaleekh/pi-background-tasks');
-      assert.deepEqual(parsed.scheduler.backgroundTasks, before, 'only the verified namespace migrates; scope, receipt, v1 identity and budgets survive');
+      assert.deepEqual(parsed.scheduler.backgroundTasks, before, 'only the verified namespace migrates; scope, receipt, subagent identity and budgets survive');
       const report = observeHostMessage(parsed.scheduler.backgroundTasks, { role: 'custom', customType: 'background-task-notification', details: { id: 'legacy-bg', status: 'completed' } });
       assert.equal(report.state.tasks[0].hostReported, true, 'native report matches the parsed canonical identity');
-      assert.deepEqual(report.state.tasks[1], before.tasks[1], 'native report does not consume the v1 sibling');
+      assert.deepEqual(report.state.tasks[1], before.tasks[1], 'native report does not consume the subagent sibling');
     } finally { await h.close(); }
   });
 }
-
-test('R2: public foreground v1 sync result counts as independent progress without enrolling or renewing sibling', async () => {
-  const h = await extensionFixture();
-  try {
-    await h.begin();
-    await h.result(workflowV1.launch('waiting'));
-    await h.settle();
-    const before = (await h.goal()).scheduler.backgroundTasks;
-    assert.ok(before.tasks[0].wait, 'precondition: sibling already has a budget');
-    await h.begin();
-    await h.result({ toolName: 'workflow', toolCallId: 'foreground-sync', input: { workflow: 'independent' }, isError: false,
-      details: { contractVersion: 1, runId: 'sync', executionEpoch: 1, originSessionId: OWNER, sessionId: OWNER, meta: { name: 'independent' }, phases: [], logs: [], result: 'done', durationMs: 12, tokenUsage: {} },
-      structuredContent: { runId: 'sync', status: 'completed', result: 'done' }, content: [{ type: 'text', text: 'completed' }] });
-    await h.settle();
-    const goal = await h.goal();
-    assert.equal(goal.scheduler.phase, 'ready', 'completed independent sync work must defer task wait like an ordinary read');
-    assert.deepEqual(goal.scheduler.backgroundTasks, before, 'foreground work neither enrolls a task nor changes the sibling receipt or budget');
-  } finally { await h.close(); }
-});
 
 const B = 'followup-session-b';
 const tasks = goal => goal.scheduler?.backgroundTasks?.tasks ?? [];

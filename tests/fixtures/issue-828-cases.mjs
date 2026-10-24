@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { extensionFixture, producers, lifecycle, work, GOAL_ID, workflowV1 } from "./issue-828-extension.mjs";
+import { extensionFixture, producers, work, GOAL_ID } from "./issue-828-extension.mjs";
 
 async function fixture(t, options = {}) {
 	const h = await extensionFixture(options);
@@ -26,31 +26,6 @@ for (const [name, producer] of Object.entries(producers)) {
 		await h.begin();
 		assert.equal(await h.call(producer.poll("first")[0], { id: "first", action: "stop" }), undefined);
 	});
-}
-
-for (const order of ["lifecycle-host", "host-lifecycle"]) {
-	for (const sibling of [false, true]) {
-		test(`828.1 workflow ${order} preserves sibling=${sibling}`, async t => {
-			const h = await fixture(t);
-			await h.begin();
-			await h.result(workflowV1.launch("fast"));
-			if (sibling) await h.result(workflowV1.launch("slow"));
-			await h.settle();
-			if (order === "lifecycle-host") h.lifecycle(workflowV1.lifecycle("fast", "completed"));
-			await h.message(workflowV1.host("fast", "opaque-delivery-1"));
-			if (order === "host-lifecycle") h.lifecycle(workflowV1.lifecycle("fast", "completed"));
-			await h.begin();
-			await h.settle();
-			const goal = await h.goal();
-			const tasks = goal.scheduler.backgroundTasks.tasks;
-			assert.equal(tasks.find(task => task.taskId === "fast").hostReported, true, "matching workflow delivery consumed");
-			assert.equal(goal.status, "active");
-			if (sibling) {
-				assert.equal(tasks.find(task => task.taskId === "slow").hostReported, false, "host report must not consume running sibling");
-				assert.equal(goal.scheduler.wait?.taskId, "slow");
-			} else assert.equal(goal.scheduler.wait, undefined);
-		});
-	}
 }
 
 test("828.2 create_goal cannot inherit previous goal tasks or old notifications", async t => {
@@ -124,21 +99,6 @@ for (const progress of [false, true]) {
 	});
 }
 
-test("828.4 early lifecycle before first wait still has bounded delivery guard", async t => {
-	const h = await fixture(t);
-	t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1800000000000 });
-	await h.begin();
-	await h.result(producers.workflow.launch("early"));
-	h.lifecycle(lifecycle("early", "completed"));
-	h.lifecycle(lifecycle("early", "completed"));
-	await h.settle();
-	const goal = await h.goal();
-	assert.equal(goal.scheduler.phase, "waiting");
-	assert.equal(goal.scheduler.wait?.deadline, 1800000660000, "terminal evidence is not host delivery; guard needs deadline");
-	t.mock.timers.tick(660000);
-	assert.equal((await h.goal()).status, "paused");
-});
-
 test("828.5 ordinary user input retains generic task tracking", async t => {
 	const h = await fixture(t);
 	await h.begin();
@@ -153,64 +113,16 @@ test("828.5 ordinary user input retains generic task tracking", async t => {
 	assert.equal(goal.scheduler.backgroundTasks.tasks[0].hostReported, false);
 });
 
-for (const foreignSession of [false, true]) {
-	test(`828.5 workflow lifecycle is producer and session scoped foreign=${foreignSession}`, async t => {
-		const h = await fixture(t);
-		await h.begin();
-		await h.result(producers.workflow.launch("same"));
-		await h.result(producers.subagent.launch("same"));
-		await h.settle();
-		h.lifecycle(lifecycle("same", "failed", foreignSession ? "unrelated-session" : undefined));
-		const tasks = (await h.goal()).scheduler.backgroundTasks.tasks;
-		assert.equal(tasks.length, 2);
-		assert.equal(tasks.find(task => task.toolName === "subagent").outcome, undefined, "workflow event cannot complete subagent with same bare ID");
-		assert.equal(tasks.find(task => task.toolName === "workflow").outcome, foreignSession ? undefined : "failed");
-	});
-}
-
-test("828.5 generic failed result keeps failed outcome and cannot settle another producer", async t => {
+test("828.5 BG failed result keeps failed outcome and cannot settle another producer", async t => {
 	const h = await fixture(t);
 	await h.begin();
-	await h.result(producers.generic.launch("same"));
+	await h.result(producers.background.launch("same"));
 	await h.result(producers.subagent.launch("same"));
 	await h.settle();
 	await h.result({ toolName: "bg_status", toolCallId: "terminal", input: { id: "same" }, isError: false, details: { task: { id: "same", status: "failed" } }, content: [] });
 	const tasks = (await h.goal()).scheduler.backgroundTasks.tasks;
 	assert.equal(tasks.find(task => task.toolName === "bg_run").outcome, "failed");
 	assert.equal(tasks.find(task => task.toolName === "subagent").outcome, undefined);
-});
-
-test("828.6 explicit workflow resumedFrom reopens same ID exactly once", async t => {
-	const h = await fixture(t);
-	await h.begin();
-	await h.result(producers.workflow.launch("resume"));
-	await h.settle();
-	await h.message(producers.workflow.host("opaque-old"));
-	h.lifecycle(lifecycle("resume", "stopped"));
-	await h.begin();
-	await h.result(producers.workflow.resume("resume"));
-	h.lifecycle(lifecycle("resume", "resumed"));
-	await h.result(producers.workflow.resume("resume"));
-	await h.settle();
-	const goal = await h.goal();
-	assert.equal(goal.scheduler.wait?.taskId, "resume", "real same-ID resume must wait for the new execution");
-	assert.equal(goal.scheduler.backgroundTasks.tasks.length, 1);
-	assert.equal(goal.scheduler.backgroundTasks.tasks[0].outcome, undefined);
-	assert.equal(goal.scheduler.backgroundTasks.tasks[0].hostReported, false);
-});
-
-test("828 duplicate launch with new receipt is not explicit workflow resume", async t => {
-	const h = await fixture(t);
-	await h.begin();
-	await h.result(workflowV1.launch("done"));
-	await h.settle();
-	await h.message(workflowV1.host("done", "opaque-done"));
-	h.lifecycle(workflowV1.lifecycle("done", "completed"));
-	await h.result(workflowV1.launch("done", "unrelated-new-receipt"));
-	await h.settle();
-	const task = (await h.goal()).scheduler.backgroundTasks.tasks[0];
-	assert.equal(task.outcome, "completed");
-	assert.equal(task.hostReported, true);
 });
 
 test("828.7 exact +10m permits one authorized query then blocks repeated poll", async t => {
@@ -319,17 +231,6 @@ test("828.3 standing deadline pauses at exactly 660000ms after consumed check", 
 	assert.equal((await h.goal()).status, "paused");
 	assert.match((await h.goal()).pauseReason, /deadline/i);
 	assert.equal(h.sent.length, 1);
-});
-
-test("828.5 foreign session lifecycle cannot change matching workflow", async t => {
-	const h = await fixture(t);
-	await h.begin();
-	await h.result(producers.workflow.launch("foreign"));
-	await h.settle();
-	h.lifecycle(lifecycle("foreign", "failed", "foreign-session"));
-	const goal = await h.goal();
-	assert.equal(goal.scheduler.wait.taskId, "foreign");
-	assert.equal(goal.scheduler.backgroundTasks.tasks[0].outcome, undefined, "wrong session is not terminal evidence");
 });
 
 test("828 partial result rewait keeps original sibling quota before deadline", async t => {
