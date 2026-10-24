@@ -190,8 +190,6 @@ test('F5 draft: post-confirmation flush rejection keeps draft retryable and does
   try {
     await h.command('goal', 'Draft a new goal');
     assert.ok(h.entries.some(entry => entry.customType === 'pi-goal-draft' && !entry.data.clearedAt), 'precondition: draft active');
-    // The pre-dialog flush succeeds. Public confirmation callback models another
-    // host event dirtying the old goal before replaceGoal attempts its own flush.
     h.ctx.ui.select = async (_title, labels) => {
       if (labels.some(label => label.includes('Confirm —'))) {
         await h.begin();

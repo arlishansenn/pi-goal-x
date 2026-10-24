@@ -1,20 +1,3 @@
-/**
- * Producer-aware background-task registry for the goal scheduler.
- *
- * PR #83 detects a single pending task from structured lifecycle fields and
- * parks it in scheduler memory. This registry keeps that generic detector as
- * one adapter and adds the producer contracts the fork actually runs
- * (nicobailon/pi-subagents async receipts, @quintinshaw/pi-dynamic-workflows
- * background launches), while persisting a task set keyed by
- * (producer, task id, producer execution epoch) so siblings and old delivery
- * identities survive launches, takeover and reload.
- *
- * The registry owns parsing, identity, terminal evidence and per-task wait
- * budgets. It never arms timers, sends messages or changes goal lifecycle:
- * authorization stays in GoalScheduler, which projects the earliest budget
- * onto the existing single wait.
- */
-
 import { asRecord } from "./goal-record.ts";
 import { observeBackgroundTask, type TaskResultLike } from "./goal-background-task.ts";
 
