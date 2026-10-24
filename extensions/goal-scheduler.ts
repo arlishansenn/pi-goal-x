@@ -5,25 +5,6 @@ import { asRecord, type GoalRecord } from "./goal-record.ts";
 import { budgetReached } from "./goal-accounting.ts";
 import { loadGoalSettings, invalidateGoalSettingsCache } from "./goal-settings.ts";
 import { newGoalScheduler, schedulerSummary, type GoalContinuation, type GoalSchedulerState } from "./goal-scheduler-state.ts";
-import {
-	allocateWaits, consumeDueChecks, isTaskPoll, observeHostMessage, observeLifecycle, observeToolResult,
-	outstandingTasks, projectWait, type BackgroundTasksState,
-} from "./goal-background-registry.ts";
-import { isPendingTaskPoll, observeBackgroundTask, type BackgroundTaskRef, type TaskResultLike } from "./goal-background-task.ts";
-import { CORE_GOAL_TOOL_NAMES } from "./goal-tool-names.ts";
-
-/** Goal bookkeeping results describe the goal; they are never deferring work. */
-const BOOKKEEPING_TOOL_NAMES = new Set<string>(CORE_GOAL_TOOL_NAMES);
-
-/**
- * How long a task wait sleeps before the scheduled re-check, in milliseconds.
- * The wait is event-driven: this interval only covers a result report that
- * never arrives.
- */
-export const BACKGROUND_TASK_WAIT_MS = 10 * 60_000;
-
-/** Slack over the re-check interval so the check dispatch always wins over the deadline pause. */
-const BACKGROUND_TASK_DEADLINE_MARGIN_MS = 60_000;
 
 /** Scheduling intent is durable; timers only arrange an opportunity to claim it. */
 export class GoalScheduler {
@@ -33,30 +14,18 @@ export class GoalScheduler {
 	private armedGeneration: string | undefined;
 	private declared = false;
 	private runGoalId: string | undefined;
-	/** Detached work this session tracks; persisted into scheduler state at settlement. */
-	private tasks: BackgroundTasksState | undefined;
-	/** Whether this run did work after it recorded the pending task. Per run. */
-	private postTaskProgress = false;
 	private denied = false;
 	private unsubscribe: (() => void) | undefined;
-	private unsubscribeLifecycle: (() => void) | undefined;
 	private core: GoalCore;
 	constructor(core: GoalCore) { this.core = core; }
 
 	private owner(ctx: ExtensionContext): string { return ctx.sessionManager.getSessionId() || "unknown-session"; }
 	private limit(ctx: ExtensionContext): number | undefined { return loadGoalSettings(ctx.cwd).maxAutonomousRuns; }
 	private strict(ctx: ExtensionContext, s: GoalSchedulerState): boolean {
-		// A wait the runtime raised for a detected background task stays
-		// system-managed: it must not put the goal under the explicit execution
-		// contract, or every later turn would owe a declaration the model did not
-		// choose to make.
-		return loadGoalSettings(ctx.cwd).strictExecutionContract === true || (!!s.wait && s.wait.taskId === undefined);
+		return loadGoalSettings(ctx.cwd).strictExecutionContract === true || !!s.wait;
 	}
 	private implicitReady(s: GoalSchedulerState): void {
 		s.phase = "ready"; s.dispatch = undefined; s.generation = randomUUID();
-		// A task wait ends with the task: the result is the context for the next run.
-		if (s.wait?.taskId !== undefined) s.wait = undefined;
-		s.postTaskProgress = false;
 		s.decision = { kind: "ready", purpose: "ready" };
 	}
 	private available(ctx: ExtensionContext, s: GoalSchedulerState): boolean {
@@ -115,174 +84,25 @@ export class GoalScheduler {
 		return this.limit(ctx) === 0 ? "Automatic continuation disabled by maxAutonomousRuns=0. Change the setting in /goal-settings, then use /goal-resume." : "Autonomous-run allowance exhausted. Increase or remove maxAutonomousRuns, or use /goal-resume to renew.";
 	}
 
-	/** Bind once per live session. The events are deliberately not triggerTurn messages. */
+	/** Bind once per live session. The event is deliberately not a triggerTurn message. */
 	attach(ctx: ExtensionContext): void {
 		this.ctx = ctx;
 		this.unsubscribe?.();
-		this.unsubscribeLifecycle?.();
 		this.unsubscribe = this.core.pi.events?.on("pi-goal:wake", (event: unknown) => {
 			const raw = asRecord(event);
 			if (raw && this.ctx) this.signal(this.ctx, raw.goalId, raw.waitToken);
 		});
-		// Terminal evidence from the workflow lifecycle bus: correlation only, the
-		// native workflow-result host message still owns wakeup and delivery.
-		this.unsubscribeLifecycle = this.core.pi.events?.on("pi-dynamic-workflows:lifecycle", (event: unknown) => {
-			this.noteTaskLifecycle(event);
-		});
 	}
-	shutdown(): void { this.cancelTimer(); this.unsubscribe?.(); this.unsubscribeLifecycle?.(); this.unsubscribe = undefined; this.ctx = undefined; this.tasks = undefined; this.postTaskProgress = false; }
-
-	/**
-	 * Read a tool result for detached work through the producer registry. The
-	 * in-memory set tracks the live session; the durable copy is written at
-	 * settlement and on every successful scheduling update. A result that
-	 * reports neither a running status nor a background launch is ignored.
-	 *
-	 * A result that arrives after this run recorded a task is also remembered as
-	 * progress: settlement then defers the wait, because work that does not depend
-	 * on the task's result must not be stranded behind it.
-	 */
-	noteToolResult(event: TaskResultLike & { toolCallId?: string }): BackgroundTaskRef | null {
-		// Detached work only matters while the focused goal can sleep on it. A
-		// complete, paused, or non-continuing goal neither tracks nor announces.
-		const canWait = this.canWaitForTask();
-		if (!canWait && !this.tasks) return null;
-		const observation = observeToolResult(this.tasks, event);
-		if (!observation.observed) { this.notePostTaskProgress(event); return null; }
-		if (!canWait && observation.launched) {
-			// Inert while the goal cannot wait: drop the launch, keep only
-			// terminal evidence for tasks that were already tracked.
-			this.tasks = { version: 1, tasks: observation.state.tasks.filter(t => this.tasks?.tasks.some(prev => prev.producer === t.producer && prev.taskId === t.taskId) ?? false) };
-			return null;
-		}
-		this.tasks = observation.state;
-		if (observation.settled) this.persistTasks();
-		if (!observation.launched) return null;
-		// The result that records the task is a launch, not progress: it announces
-		// detached work instead of doing any. A later launch is treated the same.
-		return { id: observation.launched.taskId, label: observation.launched.label, toolName: observation.launched.toolName };
-	}
-
-	/** A producer lifecycle bus event: terminal evidence without host delivery. */
-	noteTaskLifecycle(payload: unknown): void {
-		if (!this.tasks) return;
-		const result = observeLifecycle(this.tasks, payload);
-		if (result.changed) { this.tasks = result.state; this.persistTasks(); }
-	}
-
-	/** Best-effort durable sync of the in-memory task set; settlement writes authoritatively. */
-	private persistTasks(): void {
-		const ctx = this.ctx;
-		if (!ctx || !this.tasks) return;
-		try { this.update(ctx, s => { s.backgroundTasks = this.tasks; }); }
-		catch { /* Mid-turn writes are buffered; settlement persists the whole set. */ }
-	}
-
-	/**
-	 * Record that this run did work after it recorded a detached task. Goal
-	 * bookkeeping and a refused poll of a tracked task are not work, so they
-	 * never defer the wait. The flag is persisted once per run so a reload does
-	 * not lose the deferral; settlement reads the in-memory value.
-	 */
-	private notePostTaskProgress(event: TaskResultLike): void {
-		if (outstandingTasks(this.tasks).length === 0 || this.postTaskProgress) return;
-		if (BOOKKEEPING_TOOL_NAMES.has(event.toolName)) return;
-		if (isTaskPoll(this.tasks, event.toolName, event.input)) return;
-		this.postTaskProgress = true;
-		const ctx = this.ctx;
-		if (!ctx) return;
-		try { this.update(ctx, s => { s.postTaskProgress = true; }); }
-		catch { /* Durability only: settlement still defers from the in-memory flag. */ }
-	}
-
-	/** Whether settlement would defer for a detected task: an active auto-continue goal. */
-	private canWaitForTask(): boolean {
-		const goal = this.core.state.goal;
-		return goal !== null && goal.status === "active" && goal.autoContinue;
-	}
-
-	/** The outstanding background tasks of this session, oldest deadline first. */
-	pendingBackgroundTasks(): BackgroundTaskRef[] {
-		return outstandingTasks(this.tasks).map(t => ({ id: t.taskId, label: t.label, toolName: t.toolName }));
-	}
-
-	/** The primary task, kept for the ported single-task accessors and notices. */
-	pendingBackgroundTask(): BackgroundTaskRef | null { return this.pendingBackgroundTasks()[0] ?? null; }
-
-	/** Whether a call would wait on a tracked task again instead of ending the turn. */
-	blocksTaskPoll(toolName: string, input: unknown): boolean {
-		return this.canWaitForTask() && isTaskPoll(this.tasks, toolName, input);
-	}
-
-	/**
-	 * Sleep until pi reports the pending task's result, with one scheduled
-	 * re-check in case the report never arrives. The standing deadline bounds a
-	 * goal whose report keeps getting lost; once it expires the deadline pause
-	 * governs and no further task wait is raised.
-	 */
-	private deferForTask(ctx: ExtensionContext): void {
-		const now = Date.now();
-		// Budgets are canonical: the first wait allocates them, later waits only
-		// re-project. No re-wait can renew a deadline or check quota.
-		this.tasks = allocateWaits(this.tasks ?? { version: 1, tasks: [] }, now);
-		const projection = projectWait(this.tasks!);
-		if (!projection || projection.deadline <= now) {
-			// The standing deadline governs: schedule() raises the deadline pause.
-			this.schedule(ctx);
-			return;
-		}
-		const goal = this.update(ctx, s => {
-			s.backgroundTasks = this.tasks;
-			s.wait = {
-				id: s.wait?.taskId !== undefined ? s.wait.id : randomUUID(),
-				token: randomUUID(),
-				taskId: projection.id,
-				reason: `Waiting for ${projection.label} to finish.`,
-				deadline: projection.deadline,
-				intervalMs: BACKGROUND_TASK_WAIT_MS,
-				remainingChecks: projection.remainingChecks,
-				nextCheckAt: projection.nextCheckAt,
-			};
-			s.phase = "waiting"; s.decision = { kind: "wait" }; s.dispatch = undefined; s.generation = randomUUID();
-			s.postTaskProgress = false;
-		});
-		this.cancelTimer();
-		this.core.runtime.clearContinuationState();
-		this.core.runtime.markTurnStopped(goal.id);
-		// No notification here: ui.notify renders a transient status row, which
-		// resizes the editor and clips the goal widget for as long as it shows.
-		// The wait is already visible in the widget's scheduling rows and in the
-		// injected state, and it is a routine event, not something to announce.
-		// Arm the re-check. The wait is event-driven, so this timer only covers a
-		// result report that never arrives.
-		this.schedule(ctx);
-	}
-
-	/**
-	 * Defer the task wait because the run did work after the detection. Mirrors
-	 * the declared-ready dispatch: persist a ready decision whose next action
-	 * steers the model at the independent work, then arm the continuation. A
-	 * later settle without new work raises the wait as usual.
-	 */
-	private deferForTaskProgress(ctx: ExtensionContext): void {
-		this.update(ctx, s => {
-			this.implicitReady(s);
-			s.backgroundTasks = this.tasks;
-			s.postTaskProgress = false;
-			s.decision = { kind: "ready", purpose: "ready" };
-		});
-		this.schedule(ctx);
-	}
+	shutdown(): void { this.cancelTimer(); this.unsubscribe?.(); this.unsubscribe = undefined; this.ctx = undefined; }
 
 	restore(ctx: ExtensionContext): void {
 		this.attach(ctx);
-		this.inRun = false; this.declared = false; this.runGoalId = undefined; this.postTaskProgress = false;
+		this.inRun = false; this.declared = false; this.runGoalId = undefined;
 		this.cancelTimer();
 		this.safe(ctx, () => {
 			this.core.reconcileFocusedGoalFromDisk(ctx);
 			const goal = this.core.state.goal;
-			if (!goal || goal.status !== "active" || !goal.autoContinue || !goal.scheduler) { this.tasks = undefined; return; }
-			this.tasks = goal.scheduler.backgroundTasks; // same-session reopen keeps identities and budgets
+			if (!goal || goal.status !== "active" || !goal.autoContinue || !goal.scheduler) return;
 			const s = goal.scheduler;
 			if (s.owner !== this.owner(ctx)) { ctx.ui.notify("Goal owned by another session. Use /goal-resume to take ownership.", "info"); return; }
 			if (["claimed", "running", "interrupted"].includes(s.phase)) {
@@ -303,11 +123,8 @@ export class GoalScheduler {
 			this.write(ctx, g => {
 				if (g.status === "complete" || budgetReached(g)) throw new Error("A completed or token-budget-limited goal cannot resume.");
 				return { ...g, status: "active", autoContinue: true, stopReason: undefined, pauseReason: undefined, pauseSuggestedAction: undefined,
-					// Resume renews allowance, not task evidence: surviving tasks keep
-					// their identities and already-spent wait budgets.
-					scheduler: { ...newGoalScheduler(this.owner(ctx)), backgroundTasks: g.scheduler?.backgroundTasks, phase: "ready", decision: { kind: "ready", purpose: "kickoff" } } };
+					scheduler: { ...newGoalScheduler(this.owner(ctx)), phase: "ready", decision: { kind: "ready", purpose: "kickoff" } } };
 			});
-			this.tasks = this.core.state.goal?.scheduler?.backgroundTasks;
 			// A resume during host work waits for settlement; another model turn
 			// still invalidates it through turn(), just like a declaration.
 			this.declared = this.inRun;
@@ -334,7 +151,6 @@ export class GoalScheduler {
 				if (!this.available(ctx, s)) throw new Error(this.allowanceReason(ctx));
 				if (input.kind === "ready") {
 					s.phase = "ready"; s.decision = { kind: "ready", purpose: "ready" }; s.wait = undefined;
-					s.postTaskProgress = false;
 				} else if (input.kind === "wait") {
 					if (!this.strict(ctx, s)) throw new Error("New waits require strictExecutionContract=true in /goal-settings. This is a user preference; continue pursuing the goal without a wait unless the user opts in.");
 					if (typeof input.reason !== "string" || !input.reason.trim() || input.reason.length > 2000) throw new Error("wait requires a nonempty reason (at most 2000 characters).");
@@ -369,10 +185,6 @@ export class GoalScheduler {
 		this.ctx = ctx;
 		if (this.inRun) { this.core.runningGoalId = this.core.state.goal?.id ?? null; return; }
 		this.inRun = true; this.declared = false; this.denied = false;
-		// A detached task outlives one run: the deferred continuation must still
-		// see it so a run that does no new work can raise the wait. Only the
-		// per-run progress flag resets here.
-		this.postTaskProgress = false;
 		this.runGoalId = this.core.state.goal?.id;
 		this.cancelTimer(); this.core.runtime.clearContinuationTimer();
 		this.core.runningGoalId = this.core.state.goal?.id ?? null;
@@ -403,27 +215,16 @@ export class GoalScheduler {
 			}
 			return;
 		}
-		// A producer's native report discharges the task it identifies before the
-		// host turn takes over; unidentified reports change nothing.
-		if (this.tasks) {
-			const observed = observeHostMessage(this.tasks, rawMessage);
-			if (observed.state !== this.tasks) { this.tasks = observed.state; this.persistTasks(); }
-		}
 		// Genuine host work supersedes an old scheduling claim, but never resets used.
 		this.takeover(ctx);
 	}
 	takeover(ctx: ExtensionContext): void {
 		this.cancelTimer(); this.core.runtime.clearContinuationState();
 		this.declared = false;
-		// The tracked task set survives takeover: a user instruction or producer
-		// report must not drop other still-running tasks. Only the projected wait
-		// and the per-run progress flag reset; budgets stay canonical in the set.
-		this.postTaskProgress = false;
 		const s = this.core.state.goal?.scheduler;
 		if (!s || s.owner !== this.owner(ctx)) return;
 		this.safe(ctx, () => this.update(ctx, state => {
 			state.generation = randomUUID(); state.phase = "idle"; state.decision = undefined; state.dispatch = undefined; state.wait = undefined;
-			state.backgroundTasks = this.tasks;
 			state.repairUsed = false;
 		}));
 	}
@@ -436,19 +237,6 @@ export class GoalScheduler {
 			if (!goal || goal.status !== "active" || !goal.autoContinue || !successful) return;
 			if (this.declared && goal.scheduler?.decision) { this.schedule(ctx); return; }
 			const s = this.state(ctx, goal);
-			// Detached work is a wait, not a disposition: sleep instead of running a
-			// continuation that could only poll the task pi already reports on. A run
-			// that did work after the detection defers the wait instead, so that work
-			// is not stranded behind the task.
-			const outstanding = outstandingTasks(this.tasks);
-			if (outstanding.length > 0) {
-				const progressed = this.postTaskProgress;
-				this.postTaskProgress = false;
-				if (progressed) { this.deferForTaskProgress(ctx); return; }
-				this.deferForTask(ctx); return;
-			}
-			this.postTaskProgress = false;
-			this.tasks = this.tasks && this.tasks.tasks.length > 0 ? this.tasks : undefined;
 			if (!this.strict(ctx, s)) {
 				this.update(ctx, state => this.implicitReady(state));
 				this.schedule(ctx); return;
@@ -498,9 +286,7 @@ export class GoalScheduler {
 			if (s.wait && Date.now() >= s.wait.deadline) { this.pause(ctx, "Wait deadline reached."); return; }
 			if (s.phase === "waiting" && s.wait) {
 				this.core.clearActiveAccounting();
-				// A system task wait keeps sleeping until its deadline once its one
-				// check is spent; only an explicit declared wait pauses here.
-				if (!s.wait.signalled && s.wait.remainingChecks === 0 && s.wait.taskId === undefined) { this.pause(ctx, "Wait check allowance exhausted."); return; }
+				if (!s.wait.signalled && s.wait.remainingChecks === 0) { this.pause(ctx, "Wait check allowance exhausted."); return; }
 				if (!s.wait.signalled && (s.wait.nextCheckAt === undefined || s.wait.nextCheckAt > Date.now())) {
 					const due = Math.min(s.wait.deadline, s.wait.nextCheckAt ?? Infinity);
 					this.later(ctx, due - Date.now(), () => this.schedule(ctx)); return;
@@ -527,22 +313,10 @@ export class GoalScheduler {
 				let kind = s.phase === "ready" && s.decision?.kind === "ready" ? s.decision.purpose : undefined;
 				if (s.phase === "waiting" && s.wait) {
 					if (s.wait.signalled) kind = "wake";
-					else if (s.wait.nextCheckAt !== undefined && s.wait.nextCheckAt <= Date.now() && (s.wait.remainingChecks ?? 0) > 0) {
-						kind = "check";
-						s.wait.remainingChecks!--;
-						if (s.wait.taskId !== undefined && this.tasks) {
-							// One dispatch spends every due task check; the projection
-							// follows the canonical budgets.
-							this.tasks = consumeDueChecks(this.tasks, Date.now());
-							s.backgroundTasks = this.tasks;
-							const projection = projectWait(this.tasks);
-							if (projection) { s.wait.remainingChecks = projection.remainingChecks; s.wait.nextCheckAt = projection.nextCheckAt; }
-						}
-					}
+					else if (s.wait.nextCheckAt !== undefined && s.wait.nextCheckAt <= Date.now() && (s.wait.remainingChecks ?? 0) > 0) { kind = "check"; s.wait.remainingChecks!--; }
 				}
 				if (!kind) throw new Error("No scheduling decision authorizes this checkpoint.");
 				s.used++; s.phase = "claimed"; s.dispatch = { id: randomUUID(), kind, claimedAt: Date.now() };
-				s.postTaskProgress = false;
 				if (kind === "repair") s.repairUsed = true;
 				else if (kind !== "recovery") s.repairUsed = false;
 				if (s.wait) { s.wait.signalled = false; s.wait.token = randomUUID(); }

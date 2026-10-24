@@ -1,4 +1,4 @@
-import { schedulerSummaryParts } from "../goal-scheduler-state.ts";
+import { schedulerSummary } from "../goal-scheduler-state.ts";
 import { taskIndex } from "../goal-task-index.ts";
 /**
  * Shared dashboard view model (plan §6) — the single source of truth for the
@@ -475,16 +475,7 @@ export function deriveGoalDashboardModel(
 	const { focused, otherOpenGoals, ledgerEvents = [], activityLimit, tasksDisabled = false } = options;
 
 	const status = deriveGoalStatus(goal);
-	if (goal.status === "active" && goal.scheduler?.phase === "waiting") {
-		const wait = goal.scheduler.wait;
-		// A system task wait must not grow the widget's row count (the height
-		// latches per regime and waiting is not a regime change), so with no runs
-		// line to ride it folds into the status labels instead.
-		const taskWaitLabel = wait?.taskId !== undefined ? wait.reason.replace(/\.$/, "") : undefined;
-		status.code = "idle";
-		status.label = taskWaitLabel ?? "Waiting";
-		status.footerLabel = taskWaitLabel ?? "waiting";
-	}
+	if (goal.status === "active" && goal.scheduler?.phase === "waiting") { status.code = "idle"; status.label = "Waiting"; status.footerLabel = "waiting"; }
 	// §9.5: with tasks disabled, omit task sections entirely (status,
 	// verification, usage, path, and focus remain).
  const {taskProgress, taskTree, currentTask, taskTitles} = taskPresentation(goal, tasksDisabled);
@@ -508,15 +499,8 @@ export function deriveGoalDashboardModel(
 	if (goal.usage.activeSeconds > 0) footerUsageBits.push(formatDuration(goal.usage.activeSeconds));
 	if (goal.usage.tokensUsed > 0) footerUsageBits.push(formatCompactTokens(goal.usage.tokensUsed));
 
-	// Text surfaces let a task wait ride the runs line; the dashboard keeps its
-	// row count stable per regime, so the runs text only emits a row when a
-	// finite allowance already shows one. An unlimited task wait rides the
-	// status label above instead.
-	const summaryParts = schedulerSummaryParts(goal.scheduler, options.maxAutonomousRuns, options.showAutonomousRuns !== false);
-	const schedulingRows = (options.maxAutonomousRuns !== undefined ? [summaryParts.runs] : []).filter(Boolean);
-
 	return {
-		scheduling: schedulingRows.concat(summaryParts.instructions ? summaryParts.instructions.split("\n") : []),
+		scheduling: schedulerSummary(goal.scheduler, options.maxAutonomousRuns, options.showAutonomousRuns !== false).split("\n").filter(Boolean),
 		goalId: goal.id,
 		title: displayObjectiveTitle(goal.objective),
 		status,
