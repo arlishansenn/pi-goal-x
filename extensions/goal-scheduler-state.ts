@@ -6,11 +6,19 @@ export interface GoalWait {
 	token: string;
 	reason: string;
 	deadline: number;
+	/**
+	 * Set only on a wait the runtime raised for a detected background task. It
+	 * marks the wait as system-managed: it does not put the goal under the
+	 * explicit execution contract, and it is dropped once the goal continues.
+	 */
+	taskId?: string;
 	intervalMs?: number;
 	remainingChecks?: number;
 	nextCheckAt?: number;
 	signalled?: boolean;
 }
+import { normalizeBackgroundTasks, type BackgroundTasksState } from "./goal-background-registry.ts";
+
 export interface GoalSchedulerState {
 	version: 1;
 	owner: string;
@@ -21,6 +29,15 @@ export interface GoalSchedulerState {
 	wait?: GoalWait;
 	dispatch?: { id: string; kind: GoalDispatchKind; claimedAt: number };
 	repairUsed: boolean;
+	/**
+	 * Set when this run did work after it recorded a detached task. Settlement
+	 * defers the task wait while it is set, so work that does not depend on the
+	 * task's result is not stranded behind it. Per run: reset when a run begins
+	 * and after settlement consumes it.
+	 */
+	postTaskProgress?: boolean;
+	/** Durable producer-qualified background task set (local fork adaptation). */
+	backgroundTasks?: BackgroundTasksState;
 }
 export type GoalContinuation =
 	| { kind: "ready" }
@@ -39,6 +56,8 @@ export function normalizeGoalScheduler(raw: unknown): GoalSchedulerState | undef
 	const integer = (n: unknown) => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
 	const text = (v: unknown) => typeof v === "string" && v.length > 0 && v.length <= 2000;
 	if (s.version !== 1 || !text(s.owner) || !text(s.generation) || !integer(s.used) || typeof s.repairUsed !== "boolean" || !["idle", "ready", "waiting", "claimed", "running", "interrupted"].includes(s.phase)) return invalid();
+	if (s.postTaskProgress !== undefined && typeof s.postTaskProgress !== "boolean") return invalid();
+	if (s.backgroundTasks !== undefined && normalizeBackgroundTasks(s.backgroundTasks) === "invalid") return invalid();
 	// Goals saved before next actions were removed still carry decision.nextAction.
 	// The field is stripped after validation and never makes a goal invalid:
 	// rejecting one would strand it as interrupted with spent allowance.
@@ -46,6 +65,7 @@ export function normalizeGoalScheduler(raw: unknown): GoalSchedulerState | undef
 	if (s.wait) {
 		const w = s.wait;
 		if (!text(w.id) || !text(w.token) || !text(w.reason) || (!integer(w.deadline) || w.deadline > 8_640_000_000_000_000)) return invalid();
+		if (w.taskId !== undefined && !text(w.taskId)) return invalid();
 		if (w.intervalMs !== undefined && (!integer(w.intervalMs) || w.intervalMs < 1000 || !integer(w.remainingChecks) || !integer(w.nextCheckAt))) return invalid();
 		if (w.intervalMs === undefined && (w.remainingChecks !== undefined || w.nextCheckAt !== undefined)) return invalid();
 		if (w.signalled !== undefined && typeof w.signalled !== "boolean") return invalid();
@@ -70,10 +90,15 @@ export function schedulerSummaryParts(s: GoalSchedulerState | undefined, limit?:
 	// empty rather than rendered as "used/unlimited". A finite allowance is
 	// reported unless showAutonomousRuns is off. Enforcement reads the limit
 	// elsewhere; this is display only.
-	const runs = limit !== undefined && showRuns ? `Autonomous runs: ${s?.used ?? 0}/${limit}${limit === 0 ? " (automatic continuation disabled)" : ""}.` : "";
+	// A wait raised for a detected background task rides on the runs line instead
+	// of adding its own rows: the widget's height latches per regime, and a system
+	// task wait is not a regime change, so extra rows would be head-sliced away.
+	const taskWait = s?.wait && s.wait.taskId !== undefined ? s.wait : undefined;
+	const runsLine = limit !== undefined && showRuns ? `Autonomous runs: ${s?.used ?? 0}/${limit}${limit === 0 ? " (automatic continuation disabled)" : ""}.` : "";
+	const runs = (runsLine ? runsLine + " " : "") + (taskWait ? `${taskWait.reason}${taskWait.nextCheckAt !== undefined ? ` Next check ${new Date(taskWait.nextCheckAt).toISOString()}.` : ""}` : "");
 	const lines: string[] = [];
 	if (s) {
-		if (s.wait) {
+		if (s.wait && !taskWait) {
 			lines.push(`Waiting: ${s.wait.reason}; wait_id=${s.wait.id}; deadline=${new Date(s.wait.deadline).toISOString()}.`);
 			if (s.wait.nextCheckAt !== undefined) lines.push(`Next check: ${new Date(s.wait.nextCheckAt).toISOString()}; ${s.wait.remainingChecks} checks remaining.`);
 		}
