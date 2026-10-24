@@ -204,13 +204,14 @@ pi.registerTool(defineTool({
 			tokenBudget = budgetGate.value;
 		}
 		const { objective: cleanedObjective, verificationContract } = extractVerificationContract(objective);
-		core.replaceGoal(
+		const replaced = core.replaceGoal(
 			{ objective: cleanedObjective, autoContinue: true, sisyphus: sisyphusFlag },
 			ctx,
 			true,
 			verificationContract,
 			tokenBudget,
 		);
+		if (!replaced) return { content: [{ type: "text", text: "Goal was not created. The current goal could not be saved; resolve the transition warning and retry." }], details: goalDetails(core.state.goal), isError: true };
 		const created = core.state.goal;
 		const otherCount = otherOpenGoalCount(core.goalsById, core.focusedGoalId);
 		const otherLine = otherCount > 0

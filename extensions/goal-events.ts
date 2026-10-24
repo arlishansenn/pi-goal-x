@@ -101,19 +101,21 @@ export function registerGoalEvents(core: GoalCore): void {
 		core.goalWorkToolCalledThisTurn = false;
 		core.beginAccounting();
 		core.goalService.beginTurn(ctx, core.focusedGoalId); // P1-3 transaction buffer
+		core.scheduler.blockedByFailure(ctx);
 		core.touchGoalActivity(); // F5
 		core.updateUI(ctx);
 	});
 
 	// #4 + C9 fix + Phase 5 C3: gate in-turn tool calls based on lifecycle state.
 	pi.on("tool_call", async (event, ctx) => {
+		core.scheduler.noteToolCall(ctx, event.toolCallId);
 		const stoppedGoalId = core.currentTurnStoppedGoalId();
 		if (core.scheduler.isDenied()) return { block: true, reason: "Stale goal dispatch; use /goal-resume." };
 		// A second wait on a task the goal already sleeps on would only burn runs:
 		// pi reports the result on its own and the goal wakes for it.
 		// The pinned pi API carries tool arguments on `input` (ToolCallEventBase),
 		// never on `args`.
-		if (core.scheduler.blocksTaskPoll(event.toolName, event.input)) {
+		if (core.scheduler.blocksTaskPoll(ctx, event.toolName, event.input, event.toolCallId)) {
 			return {
 				block: true,
 				reason: `The goal is waiting on this background task, and its result is reported automatically. ` +
@@ -177,8 +179,8 @@ export function registerGoalEvents(core: GoalCore): void {
 	// Detached work is a wait, not a disposition. The notice teaches the model to
 	// stop at the moment it starts a long task instead of polling it turn after
 	// turn; the wait itself is raised at settlement, once the turn is over.
-	pi.on("tool_result", async (event, _ctx) => {
-		const task = core.scheduler.noteToolResult(event);
+	pi.on("tool_result", async (event, ctx) => {
+		const task = core.scheduler.noteToolResult(ctx, event);
 		if (!task) return;
 		return { content: [...event.content, { type: "text" as const, text: backgroundTaskNotice(task) }] };
 	});
@@ -270,7 +272,7 @@ export function registerGoalEvents(core: GoalCore): void {
 			core.updateUI(ctx);
 		}
 
-		core.goalService.endTurn(ctx); // P1-3: single flush (lock + write + ledger batch)
+		core.scheduler.flushBeforeTransition(ctx);
 	});
 
 	pi.on("message_end", async (event, ctx) => {
@@ -284,6 +286,7 @@ export function registerGoalEvents(core: GoalCore): void {
 	});
 
 	pi.on("session_start", async (event, ctx) => {
+		if (!core.scheduler.flushBeforeTransition(ctx)) return;
 		core.auditMessages.clear();
 		// NAF: the zero-op read caches are session-scoped — a new session always
 		// re-reads settings/pool/ledger fresh from disk (cross-process and
@@ -291,7 +294,6 @@ export function registerGoalEvents(core: GoalCore): void {
 		invalidateGoalSettingsCache();
 		invalidateGoalPoolCache();
 		invalidateGoalLedgerCache();
-		core.goalService.flushTurn(ctx); // P1-3: persist any buffered transaction before reload
 		await core.loadState(ctx);
 		core.installGoalToolProfile(!loadGoalSettings(ctx.cwd).disableTasks);
 		rehydrateDraft(core, ctx);
@@ -330,7 +332,7 @@ export function registerGoalEvents(core: GoalCore): void {
 	});
 
 	pi.on("session_compact", async (_event, ctx) => {
-		core.goalService.flushTurn(ctx); // P1-3: persist any buffered transaction before reload
+		if (!core.scheduler.flushBeforeTransition(ctx)) return;
 		if (core.state.goal) core.persist(ctx);
 		core.beginAccounting();
 		// Arm a deterministic compaction summary for the next agent turn.
@@ -352,7 +354,7 @@ export function registerGoalEvents(core: GoalCore): void {
 		// flush the buffered transaction and persist first. Otherwise the goal
 		// record and the ledger can disagree about a compaction that never
 		// happened.
-		core.goalService.flushTurn(ctx);
+		if (!core.scheduler.flushBeforeTransition(ctx)) return;
 		if (core.state.goal) core.persist(ctx);
 		if (event.aborted || !core.state.goal) return;
 		const detail = event.errorMessage ? `: ${event.errorMessage}` : "";
@@ -363,8 +365,8 @@ export function registerGoalEvents(core: GoalCore): void {
 	});
 
 	pi.on("session_tree", async (_event, ctx) => {
+		if (!core.scheduler.flushBeforeTransition(ctx)) return;
 		core.auditMessages.clear();
-		core.goalService.flushTurn(ctx); // P1-3: persist any buffered transaction before reload
 		await core.loadState(ctx);
 		rehydrateDraft(core, ctx);
 		syncTerminalInputPause(core, ctx);

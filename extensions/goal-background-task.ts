@@ -68,7 +68,7 @@ export interface BackgroundTaskRef {
 
 export type BackgroundTaskObservation =
 	| { kind: "running"; task: BackgroundTaskRef }
-	| { kind: "settled"; taskId: string };
+	| { kind: "settled"; taskId: string; status: string };
 
 function readId(details: Record<string, unknown>): string {
 	for (const field of ID_FIELDS) {
@@ -131,7 +131,7 @@ export function observeBackgroundTask(event: TaskResultLike): BackgroundTaskObse
 		// match a poll, which needs the id.
 		return { kind: "running", task: { id, label: readLabel(scope, id, event.toolName), toolName: event.toolName } };
 	}
-	if (SETTLED_STATUSES.has(status)) return id ? { kind: "settled", taskId: id } : null;
+	if (SETTLED_STATUSES.has(status)) return id ? { kind: "settled", taskId: id, status } : null;
 	return null;
 }
 

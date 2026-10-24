@@ -184,11 +184,11 @@ test("the task report wakes the goal and drops the wait", async t => {
 	const h = await fixture(t);
 	t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
 	h.core.scheduler.begin(h.ctx);
-	await h.result(h.running("t1"));
+	await h.result({ toolName: "bg_run", details: { task: { id: "t1", status: "running" } }, content: [] });
 	h.core.scheduler.settled(h.ctx);
 	assert.equal(h.sent.length, 0);
 	// The host reports the result on its own and opens a turn for it.
-	h.report();
+	h.core.scheduler.message(h.ctx, { role: "custom", customType: "background-task-notification", details: { id: "t1", status: "completed" } });
 	h.core.scheduler.settled(h.ctx);
 	t.mock.timers.tick(1);
 	assert.equal(h.sent.length, 1, "the goal continues on the report");
