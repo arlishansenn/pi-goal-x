@@ -131,7 +131,7 @@ export interface GoalCore {
 	toggleGoalAuditor(ctx: ExtensionContext): void;
 	queueContinuation(ctx: ExtensionContext, force?: boolean): void;
 	flushGoalTransaction(ctx: ExtensionContext): void;
-	replaceGoal(config: GoalCreationConfig, ctx: ExtensionContext, startNow?: boolean, verificationContract?: string, tokenBudget?: number): void;
+	replaceGoal(config: GoalCreationConfig, ctx: ExtensionContext, startNow?: boolean, verificationContract?: string, tokenBudget?: number): boolean;
 	/** F5: bump the last-activity timestamp (called on real work events). */
 	touchGoalActivity(): void;
 	/** F5: detect a stalled active auto-continue goal; returns the [GOAL STALLED] steering note. */
@@ -221,6 +221,7 @@ export function createGoalCore(
 		onDiagnostic: (diagnostic) => {
 			// Non-fatal failure sink: ledger appends must never roll back the
 			// authoritative state write, but they stay observable.
+			if (diagnostic.source === "storage") scheduler?.storageFailure(diagnostic.goalId, diagnostic.message);
 			console.warn(`[pi-goal] ${diagnostic.source} diagnostic: ${diagnostic.message}`);
 		},
 	});
@@ -425,8 +426,8 @@ export function createGoalCore(
 		opts: { recordLedger?: boolean } = {},
 	): void {
 		const previousGoalId = focusedGoalId;
+		if (previousGoalId !== goalId && !scheduler.flushBeforeTransition(ctx)) return;
 		if (previousGoalId !== goalId) scheduler.takeover(ctx);
-		if (previousGoalId !== goalId) goalService.flushTurn(ctx); // P1-3: persist the old buffer before switching focus
 		assignFocusedGoalId(goalId && goalsById.has(goalId) ? goalId : null);
 		if (previousGoalId !== focusedGoalId) {
 			clearContinuationState();
@@ -459,7 +460,7 @@ export function createGoalCore(
 	}
 
 	function removeFocusedGoal(ctx: ExtensionContext, reason: GoalFocusReason): void {
-		goalService.flushTurn(ctx); // P1-3: persist pending mutations before the goal leaves the session
+		if (!scheduler.flushBeforeTransition(ctx)) return;
 		if (focusedGoalId) goalsById.delete(focusedGoalId);
 		assignFocusedGoalId(null);
 		clearStoppedRuntimeState();
@@ -892,7 +893,8 @@ export function createGoalCore(
 		goalModalDepth = Math.max(0, goalModalDepth - 1);
 	}
 
-	function replaceGoal(config: GoalCreationConfig, ctx: ExtensionContext, startNow = true, verificationContract?: string, tokenBudget?: number): void {
+	function replaceGoal(config: GoalCreationConfig, ctx: ExtensionContext, startNow = true, verificationContract?: string, tokenBudget?: number): boolean {
+		if (!scheduler.flushBeforeTransition(ctx)) return false;
 		const goal = createGoal(config);
 		goal.scheduler = newGoalScheduler(ctx.sessionManager.getSessionId());
 		if (verificationContract) goal.verificationContract = verificationContract;
@@ -922,6 +924,7 @@ export function createGoalCore(
 		beginAccounting();
 		ctx.ui.notify(`${buildGoalRunningNotification(config)}\nBudget: ${goal.tokenBudget === undefined ? "none" : `${goal.tokenBudget} tokens`}`, "info");
 		if (startNow && state.goal?.autoContinue) scheduler.kickoff(ctx);
+		return true;
 	}
 
 	const core: GoalCore = {

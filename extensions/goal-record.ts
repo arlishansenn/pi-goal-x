@@ -380,7 +380,7 @@ export function normalizeGoalRecord(value: unknown): GoalRecord | null {
 		skipAuditor: raw.skipAuditor === true ? true : undefined,
 		revision: Number.isSafeInteger(raw.revision) && (raw.revision as number) >= 0 ? (raw.revision as number) : 0,
 		tokenBudget: normalizePositiveSafeInteger(raw.tokenBudget),
-		...(raw.scheduler !== undefined ? { scheduler: normalizeGoalScheduler(raw.scheduler) } : {}),
+		...(raw.scheduler !== undefined ? { scheduler: normalizeGoalScheduler(raw.scheduler, typeof raw.id === "string" && raw.id ? safeIdPart(raw.id) : undefined) } : {}),
 		taskList,
 		currentTaskId,
 		verificationContract: typeof raw.verificationContract === "string" ? raw.verificationContract : undefined,

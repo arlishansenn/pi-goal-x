@@ -27,7 +27,10 @@ export interface GoalSchedulerState {
 	phase: "idle" | "ready" | "waiting" | "claimed" | "running" | "interrupted";
 	decision?: { kind: "ready"; purpose: GoalDispatchKind } | { kind: "wait" };
 	wait?: GoalWait;
-	dispatch?: { id: string; kind: GoalDispatchKind; claimedAt: number };
+	dispatch?: { id: string; kind: GoalDispatchKind; claimedAt: number; taskCheck?: {
+		targets: { producer: string; taskId: string; receiptId: string }[];
+		admission?: { toolCallId: string; toolName: string; input: string; completed: boolean };
+	} };
 	repairUsed: boolean;
 	/**
 	 * Set when this run did work after it recorded a detached task. Settlement
@@ -48,7 +51,7 @@ export function newGoalScheduler(owner: string): GoalSchedulerState {
 }
 
 /** Corrupt scheduling data must not silently reset spent allowance. */
-export function normalizeGoalScheduler(raw: unknown): GoalSchedulerState | undefined {
+export function normalizeGoalScheduler(raw: unknown, goalId?: string): GoalSchedulerState | undefined {
 	if (raw === undefined) return undefined;
 	const invalid = (): GoalSchedulerState => ({ ...newGoalScheduler("invalid"), phase: "interrupted", used: Number.MAX_SAFE_INTEGER });
 	if (!raw || typeof raw !== "object") return invalid();
@@ -57,7 +60,8 @@ export function normalizeGoalScheduler(raw: unknown): GoalSchedulerState | undef
 	const text = (v: unknown) => typeof v === "string" && v.length > 0 && v.length <= 2000;
 	if (s.version !== 1 || !text(s.owner) || !text(s.generation) || !integer(s.used) || typeof s.repairUsed !== "boolean" || !["idle", "ready", "waiting", "claimed", "running", "interrupted"].includes(s.phase)) return invalid();
 	if (s.postTaskProgress !== undefined && typeof s.postTaskProgress !== "boolean") return invalid();
-	if (s.backgroundTasks !== undefined && normalizeBackgroundTasks(s.backgroundTasks) === "invalid") return invalid();
+	const backgroundTasks = normalizeBackgroundTasks(s.backgroundTasks);
+	if (backgroundTasks === "invalid") return invalid();
 	// Goals saved before next actions were removed still carry decision.nextAction.
 	// The field is stripped after validation and never makes a goal invalid:
 	// rejecting one would strand it as interrupted with spent allowance.
@@ -66,15 +70,28 @@ export function normalizeGoalScheduler(raw: unknown): GoalSchedulerState | undef
 		const w = s.wait;
 		if (!text(w.id) || !text(w.token) || !text(w.reason) || (!integer(w.deadline) || w.deadline > 8_640_000_000_000_000)) return invalid();
 		if (w.taskId !== undefined && !text(w.taskId)) return invalid();
-		if (w.intervalMs !== undefined && (!integer(w.intervalMs) || w.intervalMs < 1000 || !integer(w.remainingChecks) || !integer(w.nextCheckAt))) return invalid();
+		if (w.intervalMs !== undefined && (!integer(w.intervalMs) || w.intervalMs < 1000 || !integer(w.remainingChecks) || (w.remainingChecks === 0 ? w.nextCheckAt !== undefined && !integer(w.nextCheckAt) : !integer(w.nextCheckAt)))) return invalid();
 		if (w.intervalMs === undefined && (w.remainingChecks !== undefined || w.nextCheckAt !== undefined)) return invalid();
 		if (w.signalled !== undefined && typeof w.signalled !== "boolean") return invalid();
 	}
 	if (s.dispatch && (!text(s.dispatch.id) || !integer(s.dispatch.claimedAt) || !["ready", "check", "wake", "repair", "kickoff", "recovery"].includes(s.dispatch.kind))) return invalid();
+	if (s.dispatch?.taskCheck) {
+		const check = s.dispatch.taskCheck;
+		if (s.dispatch.kind !== "check" || !Array.isArray(check.targets) || check.targets.length === 0 || check.targets.some(t => !t || !text(t.producer) || typeof t.taskId !== "string" || !text(t.receiptId))) return invalid();
+		const a = check.admission;
+		if (a && (!text(a.toolCallId) || !text(a.toolName) || typeof a.input !== "string" || typeof a.completed !== "boolean")) return invalid();
+	}
 	if ((s.phase === "claimed" || s.phase === "running") && !s.dispatch) return invalid();
 	if (s.phase === "ready" && s.decision?.kind !== "ready") return invalid();
 	if (s.phase === "waiting" && (!s.wait || s.decision?.kind !== "wait")) return invalid();
 	const normalized = structuredClone(s) as GoalSchedulerState;
+	if (s.backgroundTasks !== undefined) normalized.backgroundTasks = structuredClone(backgroundTasks);
+	if (normalized.wait?.remainingChecks === 0) delete normalized.wait.nextCheckAt;
+	if (normalized.backgroundTasks && goalId) {
+		const scope = normalized.backgroundTasks.scope;
+		if (scope && scope.goalId !== goalId) return invalid();
+		if (!scope) normalized.backgroundTasks.scope = { goalId, sessionId: normalized.owner };
+	}
 	if (normalized.decision && "nextAction" in normalized.decision) delete (normalized.decision as Record<string, unknown>).nextAction;
 	return normalized;
 }

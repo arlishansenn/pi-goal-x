@@ -29,6 +29,7 @@
     ".tests/goal-files.test.ts",
     ".tests/goal-golden.test.ts",
     ".tests/goal-harness-shell.test.ts",
+    ".tests/goal-issue-828-correlation.test.ts",
     ".tests/goal-issue-828-regressions.test.ts",
     ".tests/goal-layered-settings.test.ts",
     ".tests/goal-ledger-checkpoint.test.ts",

@@ -43,7 +43,7 @@ export async function extensionFixture({ cwd: existing, owner = OWNER, hasUI = f
 		on: (name, handler) => handlers.set(name, handler),
 		getActiveTools: () => ["read", "write", "workflow", "subagent", "bg_run", "bg_status"],
 		setActiveTools() {}, appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }),
-		registerMessageRenderer() {}, sendMessage: message => sent.push(message),
+		registerMessageRenderer() {}, sendMessage: message => sent.push(message), sendUserMessage: message => sent.push(message),
 		events: { on: (name, handler) => { listeners.set(name, handler); return () => listeners.delete(name); } },
 	};
 	goalExtension(pi);
@@ -55,13 +55,13 @@ export async function extensionFixture({ cwd: existing, owner = OWNER, hasUI = f
 		assert.ok(tools.has(name), `registered tool ${name}`);
 		return tools.get(name).execute(`fixture-${name}`, input, undefined, undefined, ctx);
 	};
-	const command = async name => {
+	const command = async (name, args = "") => {
 		assert.ok(commands.has(name), `registered command ${name}`);
-		return commands.get(name).handler("", ctx);
+		return commands.get(name).handler(args, ctx);
 	};
 	await event("session_start", { reason: existing ? "resume" : "startup" });
 	return {
-		cwd, ctx, sent, notifications, event, tool, command,
+		cwd, ctx, sent, entries, notifications, event, tool, command,
 		goal: async () => (await tool("get_goal", { verbose: true })).details.goal,
 		begin: async () => { await event("agent_start"); return event("turn_start"); },
 		settle: async () => {
@@ -108,3 +108,11 @@ export const producers = {
 
 export const lifecycle = (runId, status, sessionId = OWNER) => ({ runId, status, sessionId, name: "detached work" });
 export const work = { toolName: "read", toolCallId: "independent-read", input: { file_path: "independent.txt" }, isError: false, content: [{ type: "text", text: "independent result" }] };
+
+export const workflowIdentity = (runId, executionEpoch = 1, sessionId = OWNER) => ({ contractVersion: 1, runId, executionEpoch, originSessionId: sessionId, sessionId });
+export const workflowV1 = {
+ launch: (id, receipt = `launch-${id}`) => ({ ...producers.workflow.launch(id, receipt), details: { ...workflowIdentity(id), background: true } }),
+ resume: (id, epoch = 2, receipt = `resume-${id}-${epoch}`) => ({ ...producers.workflow.resume(id, receipt), details: { ...workflowIdentity(id, epoch), background: true, resumedFrom: id } }),
+ host: (id, deliveryId, epoch = 1) => ({ ...producers.workflow.host(deliveryId), details: { ...workflowIdentity(id, epoch), deliveryId } }),
+ lifecycle: (id, status, epoch = 1) => ({ ...workflowIdentity(id, epoch), name: "detached work", status }),
+};

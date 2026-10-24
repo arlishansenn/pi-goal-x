@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { extensionFixture, producers, lifecycle, work, GOAL_ID } from "./issue-828-extension.mjs";
+import { extensionFixture, producers, lifecycle, work, GOAL_ID, workflowV1 } from "./issue-828-extension.mjs";
 
 async function fixture(t, options = {}) {
 	const h = await extensionFixture(options);
@@ -33,12 +33,12 @@ for (const order of ["lifecycle-host", "host-lifecycle"]) {
 		test(`828.1 workflow ${order} preserves sibling=${sibling}`, async t => {
 			const h = await fixture(t);
 			await h.begin();
-			await h.result(producers.workflow.launch("fast"));
-			if (sibling) await h.result(producers.workflow.launch("slow"));
+			await h.result(workflowV1.launch("fast"));
+			if (sibling) await h.result(workflowV1.launch("slow"));
 			await h.settle();
-			if (order === "lifecycle-host") h.lifecycle(lifecycle("fast", "completed"));
-			await h.message(producers.workflow.host("opaque-delivery-1"));
-			if (order === "host-lifecycle") h.lifecycle(lifecycle("fast", "completed"));
+			if (order === "lifecycle-host") h.lifecycle(workflowV1.lifecycle("fast", "completed"));
+			await h.message(workflowV1.host("fast", "opaque-delivery-1"));
+			if (order === "host-lifecycle") h.lifecycle(workflowV1.lifecycle("fast", "completed"));
 			await h.begin();
 			await h.settle();
 			const goal = await h.goal();
@@ -202,11 +202,11 @@ test("828.6 explicit workflow resumedFrom reopens same ID exactly once", async t
 test("828 duplicate launch with new receipt is not explicit workflow resume", async t => {
 	const h = await fixture(t);
 	await h.begin();
-	await h.result(producers.workflow.launch("done"));
+	await h.result(workflowV1.launch("done"));
 	await h.settle();
-	await h.message(producers.workflow.host("opaque-done"));
-	h.lifecycle(lifecycle("done", "completed"));
-	await h.result(producers.workflow.launch("done", "unrelated-new-receipt"));
+	await h.message(workflowV1.host("done", "opaque-done"));
+	h.lifecycle(workflowV1.lifecycle("done", "completed"));
+	await h.result(workflowV1.launch("done", "unrelated-new-receipt"));
 	await h.settle();
 	const task = (await h.goal()).scheduler.backgroundTasks.tasks[0];
 	assert.equal(task.outcome, "completed");
