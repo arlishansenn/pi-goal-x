@@ -13,7 +13,6 @@ import { schedulerSummary } from "../extensions/goal-scheduler-state.ts";
 import { deriveGoalDashboardModel } from "../extensions/widgets/goal-dashboard-model.ts";
 import { renderCompactDashboard } from "../extensions/widgets/goal-dashboard-renderer.ts";
 import { applyStableHeightBound } from "../extensions/widgets/goal-widget.ts";
-import { BACKGROUND_TASK_WAIT_MS } from "../extensions/goal-scheduler.ts";
 import { isPendingTaskPoll, observeBackgroundTask } from "../extensions/goal-background-task.ts";
 
 /**
@@ -159,7 +158,8 @@ test("a task wait adds no scheduling rows", async t => {
 	// is no "Autonomous runs" clause for the wait to ride; it stands alone.
 	assert.doesNotMatch(summary, /Autonomous runs/, "no runs clause without a finite allowance");
 	assert.match(summary, /Waiting for pwsh task t1 to finish/);
-	assert.match(summary, /Next check \d{4}-/);
+	assert.doesNotMatch(summary, /Next check/, "an event-driven task wait schedules no check");
+	assert.doesNotMatch(summary, /Deadline/, "no deadline is manufactured");
 });
 
 test("a detected task replaces the implicit continuation with a task wait", async t => {
@@ -172,7 +172,8 @@ test("a detected task replaces the implicit continuation with a task wait", asyn
 	assert.equal(goal.status, "active", "waiting is not a lifecycle stop");
 	assert.equal(goal.scheduler?.phase, "waiting");
 	assert.equal(goal.scheduler?.wait?.taskId, "t1");
-	assert.equal(goal.scheduler?.wait?.remainingChecks, 1);
+	assert.equal(goal.scheduler?.wait?.deadline, undefined, "no deadline is manufactured");
+	assert.equal(goal.scheduler?.wait?.remainingChecks, undefined, "no check quota is manufactured");
 	assert.match(goal.scheduler?.wait?.reason ?? "", /pwsh task t1/);
 	assert.equal(h.sent.length, 0, "the loop must not continue into a poll");
 	// ui.notify renders a transient status row that resizes the editor and clips
@@ -195,25 +196,27 @@ test("the task report wakes the goal and drops the wait", async t => {
 	assert.equal(h.core.state.goal?.scheduler?.wait, undefined);
 });
 
-test("a lost report re-checks once, then the standing deadline parks the goal", async t => {
+test("a lost report keeps the wait event-driven: no check run, no manufactured deadline", async t => {
 	const h = await fixture(t);
 	t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
 	h.core.scheduler.begin(h.ctx);
 	await h.result(h.running("t1"));
 	h.core.scheduler.settled(h.ctx);
-	t.mock.timers.tick(BACKGROUND_TASK_WAIT_MS + 1000);
-	assert.equal(h.sent.length, 1, "one scheduled re-check");
-	assert.equal(h.core.state.goal?.scheduler?.dispatch?.kind, "check");
-	// The re-check finds the task still running and waits again on the same deadline.
-	h.core.scheduler.message(h.ctx, { ...h.sent.at(-1), role: "custom" });
-	await h.result(h.running("t1"));
-	h.core.scheduler.settled(h.ctx);
+	// Issue 10 removed the +10min check and +11min system deadline: nothing but
+	// the producer's report (or a declared deadline) ends this wait.
+	t.mock.timers.tick(11 * 60_000 + 1000);
+	assert.equal(h.sent.length, 0, "no scheduled re-check is dispatched");
+	assert.equal(h.core.state.goal?.status, "active", "no manufactured deadline pauses the goal");
 	assert.equal(h.core.state.goal?.scheduler?.phase, "waiting");
 	assert.equal(h.core.state.goal?.scheduler?.wait?.taskId, "t1");
-	t.mock.timers.tick(BACKGROUND_TASK_WAIT_MS + 1000);
-	assert.equal(h.core.state.goal?.status, "paused", "the deadline ends the wait instead of looping");
-	assert.match(h.core.state.goal?.pauseReason ?? "", /deadline/i);
-	assert.equal(h.sent.length, 1, "no further run is dispatched");
+	assert.equal(h.core.state.goal?.scheduler?.wait?.deadline, undefined);
+	// The report still wakes the goal whenever it arrives.
+	h.core.scheduler.begin(h.ctx);
+	await h.result({ toolName: "pwsh", toolCallId: "report-1", details: { version: 1, taskId: "t1", status: "completed", ready: true }, input: { command: "check" }, isError: false, content: [{ type: "text" as const, text: "taskId: t1\nstatus: completed" }] });
+	h.core.scheduler.settled(h.ctx);
+	t.mock.timers.tick(1);
+	assert.equal(h.sent.length, 1, "the late report wakes the goal");
+	assert.equal(h.core.state.goal?.scheduler?.wait, undefined);
 });
 
 test("an unrelated result and an untracked goal keep the normal loop", async t => {
@@ -254,13 +257,12 @@ test("a task wait keeps the latched dashboard height and its box footer", () => 
 	// away and the box footer is the first casualty.
 	const theme = { fg: (_color: string, value: string) => value, bold: (value: string) => value } as never;
 	const base = createGoal({ objective: "Wait for detached work", autoContinue: true, sisyphus: false });
-	const now = Date.now();
 	const waiting = {
 		...base,
 		scheduler: {
 			version: 1 as const, owner: "owner", generation: "gen-1", used: 1,
 			phase: "waiting" as const, decision: { kind: "wait" as const },
-			wait: { id: "wait-1", token: "token-1", taskId: "t1", reason: "Waiting for pwsh task t1 to finish.", deadline: now + 660_000, intervalMs: 600_000, remainingChecks: 1, nextCheckAt: now + 600_000 },
+			wait: { id: "wait-1", token: "token-1", taskId: "t1", reason: "Waiting for pwsh task t1 to finish." },
 			repairUsed: false,
 		},
 	};

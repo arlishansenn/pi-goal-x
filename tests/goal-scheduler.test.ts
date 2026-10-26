@@ -162,7 +162,8 @@ test("checks retain identity, deadline and finite count across redeclaration", a
 	h.core.scheduler.settled(h.ctx); t.mock.timers.tick(999); assert.equal(h.sent.length, 0); t.mock.timers.tick(2);
 	assert.equal(h.sent.length, 1); h.admit();
 	assert.equal(h.wait().terminate, false, "new wait cannot reset an existing check");
-	const redeclare = () => h.core.scheduler.declare(h.ctx, { kind: "wait", wait_id: first.id, reason: first.reason, deadline: new Date(first.deadline).toISOString() });
+	assert.ok(first.deadline !== undefined, "a caller-declared wait keeps its explicit deadline");
+	const redeclare = () => h.core.scheduler.declare(h.ctx, { kind: "wait", wait_id: first.id, reason: first.reason, deadline: new Date(first.deadline!).toISOString() });
 	assert.equal(redeclare().terminate, true);
 	assert.equal(h.core.state.goal?.scheduler?.wait?.remainingChecks, 1);
 	h.core.scheduler.settled(h.ctx); t.mock.timers.tick(1001); h.admit();
@@ -424,6 +425,7 @@ test("existing waits keep identity, deadline and repair bounds after opt-out", a
  const wait = structuredClone(h.core.state.goal!.scheduler!.wait!);
  saveGoalSettingsFileConfig(h.cwd, {strictExecutionContract: false, maxAutonomousRuns: 8});
  h.core.scheduler.settled(h.ctx); t.mock.timers.tick(1001); h.admit();
+ assert.ok(wait.deadline !== undefined, "a caller-declared wait keeps its explicit deadline");
  assert.equal(h.core.scheduler.declare(h.ctx, {kind: "wait", wait_id: wait.id, reason: wait.reason, deadline: new Date(wait.deadline).toISOString()}).terminate, true);
  assert.equal(h.core.state.goal?.scheduler?.wait?.remainingChecks, 1);
  assert.equal(h.core.state.goal?.scheduler?.wait?.deadline, wait.deadline);

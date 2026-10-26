@@ -18,7 +18,7 @@ for (const namespace of ['structured:bg_run', 'structured:bg_status']) {
       const goal = await h.goal();
       const file = path.resolve(h.cwd, goal.activePath);
       const before = parseGoalFile(file).scheduler.backgroundTasks;
-      assert.ok(before.tasks[0].wait, 'precondition: canonical task has an allocated budget');
+      assert.ok(before.tasks[0] && !before.tasks[0].hostReported, 'precondition: canonical task is tracked');
       const raw = readFileSync(file, 'utf8');
       assert.ok(raw.includes('ismailsaleekh/pi-background-tasks'));
       writeFileSync(file, raw.replaceAll('ismailsaleekh/pi-background-tasks', namespace));
@@ -43,7 +43,8 @@ async function takeover(run) {
     await a.result(producers.subagent.launch('survivor'));
     await a.settle();
     const before = await a.goal();
-    assert.ok(tasks(before)[0].wait, 'precondition: old task has an allocated wait budget');
+    assert.ok(tasks(before)[0] && !tasks(before)[0].hostReported, 'precondition: old task is tracked and outstanding');
+    assert.equal(tasks(before)[0].wait, undefined, 'precondition: issue 10 leaves no system wait budget on tasks');
     b = await extensionFixture({ cwd: a.cwd, owner: B });
     await b.command('goal-resume');
     const resumed = await b.goal();
@@ -86,7 +87,7 @@ test('F1: resumed owner still gates an old task poll without a task-check grant'
 
 for (const source of [undefined, OWNER, B]) {
   test(`F1 safety: scheduler ownership alone does not authorize old receipt delivery (reported session ${source})`, async () => {
-    await takeover(async ({ b, before }) => {
+    await takeover(async ({ b }) => {
       await b.begin();
       const report = producers.subagent.host('survivor');
       if (source !== undefined) {
@@ -96,7 +97,7 @@ for (const source of [undefined, OWNER, B]) {
       await b.message(report);
       const after = await b.goal();
       assert.equal(tasks(after).find(task => task.taskId === 'survivor').hostReported, false, 'no explicit producer delivery-transfer authorization was supplied');
-      assert.deepEqual(tasks(after).find(task => task.taskId === 'survivor').wait, tasks(before)[0].wait);
+      assert.equal(tasks(after).find(task => task.taskId === 'survivor').wait, undefined, 'no wait budget exists to transfer');
     });
   });
 }
@@ -197,7 +198,7 @@ test('F5 draft: post-confirmation flush rejection keeps draft retryable and does
 });
 
 test('F1: new owner consumes only its new receipt and keeps old deadline after reload', async () => {
-  await takeover(async ({ b, before }) => {
+  await takeover(async ({ b }) => {
     await b.begin();
     const launch = producers.subagent.launch('b-owned', 'b-owned-call');
     await b.event('tool_call', { toolCallId: 'b-owned-call', toolName: 'subagent', input: launch.input });
@@ -211,9 +212,9 @@ test('F1: new owner consumes only its new receipt and keeps old deadline after r
     assert.equal(state.tasks.find(task => task.taskId === 'b-owned').scope.sessionId, B);
     assert.equal(state.tasks.find(task => task.taskId === 'b-owned').hostReported, true);
     assert.equal(state.tasks.find(task => task.taskId === 'survivor').hostReported, false);
-    assert.deepEqual(state.tasks.find(task => task.taskId === 'survivor').wait, tasks(before)[0].wait);
+    assert.equal(state.tasks.find(task => task.taskId === 'survivor').wait, undefined, 'the survivor keeps no system budget');
     const { normalizeBackgroundTasks } = await import('../../extensions/goal-background-registry.ts');
     assert.deepEqual(JSON.parse(JSON.stringify(normalizeBackgroundTasks(state))), JSON.parse(JSON.stringify(state)));
-    assert.equal((await b.goal()).scheduler.wait.deadline, tasks(before)[0].wait.deadline);
+    assert.equal((await b.goal()).scheduler.wait.deadline, undefined, 'issue 10: no system deadline survives the reload');
   });
 });
