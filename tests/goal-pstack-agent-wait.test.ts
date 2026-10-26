@@ -1,6 +1,6 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -10,6 +10,7 @@ import { createGoal, goalFocusDetails, type GoalRecord } from "../extensions/goa
 import { writeActiveGoalFile } from "../extensions/storage/goal-files.ts";
 import { invalidateGoalSettingsCache } from "../extensions/goal-settings.ts";
 import { readGoalLedger } from "../extensions/goal-ledger.ts";
+import { RECOVERY_BACKUP_DIR } from "../extensions/goal-recovery.ts";
 
 /**
  * Issue 10 at the extension's public boundary. The launch receipt and the
@@ -365,3 +366,113 @@ test("/goal-resume reports no success when continuation is disabled", async t =>
 	assert.ok(!readGoalLedger(h.ctx).events.some(event => event.type === "goal_resumed"), "no resume is recorded");
 });
 
+function writeSession(dir: string, sessionId: string, entries: unknown[], fileName = `2026-10-26T07-00-00-000Z_${sessionId}.jsonl`): string {
+	const file = path.join(dir, fileName);
+	const header = { type: "session", version: 3, id: sessionId, timestamp: new Date(NOW).toISOString(), cwd: dir };
+	writeFileSync(file, [header, ...entries].map(line => JSON.stringify(line)).join("\n") + "\n");
+	return file;
+}
+
+test("/goal-recovery tasks settles only receipt-verified tasks, after confirmation, with a backup and ledger", async t => {
+	const h = await fixture(t, { owner: "new-session", prepare: goal => pausedWithTasks(goal, [legacyTask("a-done", "old-session"), legacyTask("a-other", "old-session"), legacyTask("a-running", "old-session")], "old-session") });
+	writeSession(h.sessionDir, "old-session", [h.agentRecord("a-done", "running"), h.agentRecord("a-done", "completed"), h.agentRecord("a-running", "running")]);
+	writeSession(h.sessionDir, "other-session", [h.agentRecord("a-other", "completed")]);
+	writeSession(h.sessionDir, "forged-session", [h.agentRecord("a-other", "completed")], "2026-10-26T08-00-00-000Z_old-session.jsonl");
+	const goalFile = path.resolve(h.cwd, h.current().activePath!);
+	const original = readFileSync(goalFile, "utf8");
+	await h.command("goal-recovery", "tasks");
+	const tasks = h.current().scheduler?.backgroundTasks?.tasks ?? [];
+	assert.deepEqual(tasks.map(task => [task.taskId, task.hostReported, task.outcome ?? null]), [["a-done", true, "completed"], ["a-other", false, null], ["a-running", false, null]]);
+	assert.equal(h.current().status, "paused", "recovery settles evidence; it does not resume");
+	const backupRoot = path.join(h.cwd, RECOVERY_BACKUP_DIR);
+	const [stamp] = readdirSync(backupRoot);
+	assert.equal(readFileSync(path.join(backupRoot, stamp!, path.basename(goalFile)), "utf8"), original, "the goal file is backed up before the change");
+	const recovered = readGoalLedger(h.ctx).events.filter(event => event.type === "background_task_recovered");
+	assert.equal(recovered.length, 1);
+	assert.deepEqual({ ...recovered[0], at: undefined }, { type: "background_task_recovered", goalId: "pstack-agent-fixture", producer: "structured:agent", taskId: "a-done", receiptId: "a-done", outcome: "completed", sessionId: "old-session", evidenceEntryId: "entry-a-done-completed", at: undefined });
+	assert.ok(h.notifications.some(message => /1 task/.test(message) && message.includes(stamp!)), h.notifications.join("\n"));
+});
+
+test("/goal-recovery tasks rejects latest-running, ambiguous, and malformed files; agreeing duplicates settle once", async t => {
+	const h = await fixture(t, { owner: "new-session", prepare: goal => pausedWithTasks(goal, [legacyTask("a-done", "old-session"), legacyTask("a-fork", "old-session"), legacyTask("a-tie", "old-session")], "old-session") });
+	writeSession(h.sessionDir, "old-session", [h.agentRecord("a-done", "running"), h.agentRecord("a-done", "completed"), h.agentRecord("a-done", "running")]);
+	writeSession(h.sessionDir, "old-session", [h.agentRecord("a-fork", "completed")], "2026-10-26T09-00-00-000Z_old-session.jsonl");
+	writeSession(h.sessionDir, "old-session", [h.agentRecord("a-fork", "completed")], "2026-10-26T09-15-00-000Z_old-session.jsonl");
+	// Same-status forked copies agree; a lexically later copy cannot flip them.
+	writeSession(h.sessionDir, "old-session", [h.agentRecord("a-tie", "completed")], "2026-10-26T09-30-00-000Z_old-session.jsonl");
+	writeSession(h.sessionDir, "old-session", [h.agentRecord("a-tie", "running")], "2026-10-26T09-45-00-000Z_old-session.jsonl");
+	// A malformed header in an unrelated file must not abort the scan.
+	writeFileSync(path.join(h.sessionDir, "2026-10-26T10-00-00-000Z_old-session.jsonl"), "{not json\n");
+	await h.command("goal-recovery", "tasks");
+	const tasks = h.current().scheduler?.backgroundTasks?.tasks ?? [];
+	assert.deepEqual(tasks.map(task => [task.taskId, task.hostReported]), [["a-done", false], ["a-fork", true], ["a-tie", false]], "only a latest, unambiguous terminal receipt verifies");
+	const recovered = readGoalLedger(h.ctx).events.filter(event => event.type === "background_task_recovered");
+	assert.equal(recovered.length, 1, "agreeing duplicates settle once, with one auditable event");
+	assert.equal(recovered[0]?.taskId, "a-fork");
+});
+
+test("/goal-recovery tasks settles nothing when the goal changes during confirmation", async t => {
+	const h = await fixture(t, { owner: "new-session", onConfirm: () => {
+		// A concurrent writer settles the same task while the user reads the prompt.
+		h.core.goalService.apply(h.ctx, { expectedGoalId: h.current().id, mutate: goal => {
+			const scheduler = goal.scheduler!;
+			scheduler.backgroundTasks = { ...scheduler.backgroundTasks!, tasks: scheduler.backgroundTasks!.tasks.map(task => task.taskId === "a-done" ? { ...task, hostReported: true, outcome: "completed" } : task) };
+			return { ...goal, scheduler };
+		} });
+	}, prepare: goal => pausedWithTasks(goal, [legacyTask("a-done", "old-session")], "old-session") });
+	writeSession(h.sessionDir, "old-session", [h.agentRecord("a-done", "completed")]);
+	await h.command("goal-recovery", "tasks");
+	assert.ok(h.notifications.some(message => /nothing changed/i.test(message)), h.notifications.join("\n"));
+	assert.ok(!readGoalLedger(h.ctx).events.some(event => event.type === "background_task_recovered"), "no settlement is claimed that was not applied");
+	assert.equal(existsSync(path.join(h.cwd, RECOVERY_BACKUP_DIR)), false, "no backup is taken when nothing is written");
+});
+
+for (const owner of ["new-session", "old-session"]) test(`/goal-recovery tasks leaves an active goal's lifecycle unchanged (${owner === "new-session" ? "same" : "foreign"} owner)`, async t => {
+	let prompt = "";
+	const h = await fixture(t, { owner: "new-session", onConfirm: (title, message) => { prompt = `${title}\n${message}`; }, prepare: goal => {
+		goal.scheduler = { version: 1, owner, generation: "gen-active", used: 1, phase: "idle", repairUsed: false,
+			backgroundTasks: { version: 1, scope: { goalId: goal.id, sessionId: "old-session" }, tasks: [legacyTask("a-done", "old-session")] as never } };
+	} });
+	writeSession(h.sessionDir, "old-session", [h.agentRecord("a-done", "completed")]);
+	const lifecycle = () => { const g = h.current(); return [g.status, g.autoContinue, g.pauseReason ?? null, g.scheduler?.owner, g.scheduler?.phase, g.scheduler?.used]; };
+	const before = lifecycle();
+	assert.equal(before[0], "active");
+	await h.command("goal-recovery", "tasks");
+	assert.deepEqual(h.current().scheduler?.backgroundTasks?.tasks.map(task => task.hostReported), [true]);
+	assert.deepEqual(lifecycle(), before, "recovery settles task evidence only");
+	assert.match(prompt, /lifecycle/i);
+	assert.doesNotMatch(prompt, /stays paused/i, "the prompt does not claim a pause it does not enforce");
+});
+
+test("/goal-recovery tasks settles only the confirmed set when receipts, scopes, or tasks change during confirmation", async t => {
+	const h = await fixture(t, { owner: "new-session", onConfirm: () => {
+		h.core.goalService.apply(h.ctx, { expectedGoalId: h.current().id, mutate: goal => {
+			const scheduler = goal.scheduler!;
+			const tasks = scheduler.backgroundTasks!.tasks.map(task => task.taskId === "a-receipt" ? { ...task, receiptId: "a-receipt-run-2" }
+				: task.taskId === "a-scope" ? { ...task, scope: { goalId: goal.id, sessionId: "other-session" } } : task);
+			scheduler.backgroundTasks = { ...scheduler.backgroundTasks!, tasks: [...tasks, legacyTask("a-new", "old-session") as never] };
+			return { ...goal, scheduler };
+		} });
+	}, prepare: goal => pausedWithTasks(goal, [legacyTask("a-done", "old-session"), legacyTask("a-receipt", "old-session"), legacyTask("a-scope", "old-session")], "old-session") });
+	writeSession(h.sessionDir, "old-session", ["a-done", "a-receipt", "a-scope", "a-new"].map(id => h.agentRecord(id, "completed")));
+	writeSession(h.sessionDir, "other-session", [h.agentRecord("a-scope", "completed")]);
+	await h.command("goal-recovery", "tasks");
+	const tasks = h.current().scheduler?.backgroundTasks?.tasks ?? [];
+	assert.deepEqual(tasks.map(task => [task.taskId, task.hostReported]), [["a-done", true], ["a-receipt", false], ["a-scope", false], ["a-new", false]], "a changed or new target is never settled by a confirmation that did not show it");
+	assert.deepEqual(readGoalLedger(h.ctx).events.filter(event => event.type === "background_task_recovered").map(event => (event as { taskId: string }).taskId), ["a-done"]);
+});
+
+test("/goal-recovery tasks changes nothing when declined or without a receipt", async t => {
+	const h = await fixture(t, { owner: "new-session", confirm: false, prepare: goal => pausedWithTasks(goal, [legacyTask("a-done", "old-session")], "old-session") });
+	writeSession(h.sessionDir, "old-session", [h.agentRecord("a-done", "completed")]);
+	const goalFile = path.resolve(h.cwd, h.current().activePath!);
+	const original = readFileSync(goalFile, "utf8");
+	await h.command("goal-recovery", "tasks");
+	assert.equal(readFileSync(goalFile, "utf8"), original, "a declined confirmation writes nothing");
+	assert.equal(existsSync(path.join(h.cwd, RECOVERY_BACKUP_DIR)), false);
+	rmSync(path.join(h.sessionDir), { recursive: true, force: true });
+	mkdirSync(h.sessionDir);
+	await h.command("goal-recovery", "tasks");
+	assert.ok(h.notifications.some(message => /no verified/i.test(message)), h.notifications.join("\n"));
+	assert.equal(readFileSync(goalFile, "utf8"), original);
+});

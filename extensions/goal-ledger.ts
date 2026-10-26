@@ -33,6 +33,7 @@ export type GoalLedgerEvent =
   | { type: "goal_budget_warning"; goalId: string; budget: number; tokensUsed: number; pct: number; at: string }
   | { type: "goal_stalled"; goalId: string; reason: string; at: string }
   | { type: "goal_blocked"; goalId: string; reason: string; source: "agent" | "system"; at: string }
+  | { type: "background_task_recovered"; goalId: string; producer: string; taskId: string; receiptId: string; outcome: "completed" | "failed" | "stopped"; sessionId: string; evidenceEntryId: string; at: string }
   | { type: "oracle_started"; goalId: string; fingerprint: string; provider: string; model: string; thinkingLevel?: string; reason: string; at: string }
   | { type: "oracle_result"; goalId: string; fingerprint: string; adviceId: string; disposition: "actionable" | "needs_human" | "insufficient_context"; summary: string; recommendedTitle?: string; at: string }
   | { type: "oracle_failed"; goalId: string; fingerprint: string; attempt: number; errorCode: "config" | "provider" | "aborted" | "invalid_output"; message: string; at: string }
@@ -732,6 +733,8 @@ function isValidLedgerEvent(value: unknown): value is GoalLedgerEvent {
       return typeof obj.goalId === "string" && typeof obj.budget === "number" && typeof obj.tokensUsed === "number";
     case "goal_budget_warning":
       return typeof obj.goalId === "string" && typeof obj.budget === "number" && typeof obj.tokensUsed === "number" && typeof obj.pct === "number";
+    case "background_task_recovered":
+      return typeof obj.goalId === "string" && typeof obj.producer === "string" && typeof obj.taskId === "string" && typeof obj.receiptId === "string" && typeof obj.outcome === "string" && ["completed", "failed", "stopped"].includes(obj.outcome) && typeof obj.sessionId === "string" && typeof obj.evidenceEntryId === "string";
     case "goal_stalled":
       return typeof obj.goalId === "string" && typeof obj.reason === "string";
     case "goal_blocked":

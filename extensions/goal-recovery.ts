@@ -21,7 +21,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { readGoalLedger } from "./goal-ledger.ts";
 import { GOAL_LOCK_DIR } from "./storage/goal-lock.ts";
-import { invalidateGoalPoolCache, parseGoalFile, readActiveGoalPool, type GoalFileContext } from "./storage/goal-files.ts";
+import { activePathForGoal, invalidateGoalPoolCache, parseGoalFile, readActiveGoalPool, type GoalFileContext } from "./storage/goal-files.ts";
+import { readPstackAgentRecords, type PstackAgentRecordEntry, type TrackedTask } from "./goal-background-registry.ts";
+import type { GoalRecord } from "./goal-record.ts";
 
 export const GOALS_DIR = ".pi/goals";
 export const RECOVERY_BACKUP_DIR = ".pi/goals/.recovery-backup";
@@ -157,6 +159,103 @@ function scanOrphanedSnapshotGoals(ctx: GoalFileContext): OrphanedSnapshotEntry[
 		// Missing/corrupt snapshot: no orphan data to report.
 	}
 	return out;
+}
+
+export interface VerifiedTaskReceipt {
+	producer: string;
+	taskId: string;
+	receiptId: string;
+	outcome: "completed" | "failed" | "stopped";
+	sessionId: string;
+	evidenceEntryId: string;
+}
+
+/**
+ * Latest pstack-agents record per agent, across every session file whose own
+ * header names `sessionId` (branch files included; a forged file name with a
+ * foreign header id never matches, malformed files and symlinks are skipped).
+ * Within one file, line order is the provenance. Across files, a conflicting
+ * status is ordered by the entries' own timestamps; when that cannot decide
+ * (timestamps missing or tied), the agent is returned with status "" and never
+ * settles: ambiguity is rejected rather than guessed.
+ */
+export function scanSessionPstackReceipts(sessionDir: string, sessionId: string): Map<string, PstackAgentRecordEntry> {
+	const latest = new Map<string, PstackAgentRecordEntry>();
+	const ambiguous = new Set<string>();
+	let names: string[];
+	try { names = fs.readdirSync(sessionDir); } catch { return latest; }
+	for (const name of names.filter(n => n.endsWith(".jsonl")).sort()) {
+		const file = path.join(sessionDir, name);
+		try {
+			if (fs.lstatSync(file).isSymbolicLink()) continue;
+		} catch { continue; }
+		let lines: string[];
+		try { lines = fs.readFileSync(file, "utf8").split("\n"); } catch { continue; }
+		// A malformed or missing header only disqualifies that one file.
+		try {
+			const header = lines.length > 0 ? JSON.parse(lines[0]!) as { type?: unknown; id?: unknown } : undefined;
+			if (!header || header.type !== "session" || header.id !== sessionId) continue;
+		} catch { continue; }
+		const entries: unknown[] = [];
+		for (const line of lines.slice(1)) {
+			if (!line.trim()) continue;
+			try { entries.push(JSON.parse(line)); } catch { continue; }
+		}
+		// Within one file, line order is the provenance: the last record wins.
+		for (const record of readPstackAgentRecords(entries).values()) {
+			if (ambiguous.has(record.agentId)) continue;
+			const prior = latest.get(record.agentId);
+			if (!prior) { latest.set(record.agentId, record); continue; }
+			if (prior.status === record.status) continue;
+			// Conflicting statuses across files: the later entry wins by its own
+			// timestamp; an undecidable conflict never settles.
+			if (Number.isFinite(record.at) && Number.isFinite(prior.at) && record.at !== prior.at) {
+				if (record.at > prior.at) latest.set(record.agentId, record);
+				continue;
+			}
+			ambiguous.add(record.agentId);
+			latest.set(record.agentId, { ...record, status: "" });
+		}
+	}
+	return latest;
+}
+
+/**
+ * Verify outstanding pstack agent tasks against the session records of the
+ * session that launched them. The trusted binding is the agent id, the
+ * session file header id, and the latest terminal record; `receiptId` is
+ * copied from the task for audit and incarnation matching, the records do not
+ * carry it. Anything else settles nothing. No task, ledger, or goal data is
+ * modified here.
+ */
+export function verifyRecoverableTasks(
+	tasks: readonly TrackedTask[],
+	scopeSessionId: string | undefined,
+	sessionDir: string | undefined,
+): VerifiedTaskReceipt[] {
+	if (!sessionDir) return [];
+	const receipts = new Map<string, Map<string, PstackAgentRecordEntry>>();
+	const verified: VerifiedTaskReceipt[] = [];
+	for (const task of tasks) {
+		if (task.hostReported || task.producer !== "structured:agent") continue;
+		const sessionId = task.scope?.sessionId ?? scopeSessionId;
+		if (!sessionId) continue;
+		let latest = receipts.get(sessionId);
+		if (!latest) { latest = scanSessionPstackReceipts(sessionDir, sessionId); receipts.set(sessionId, latest); }
+		const record = latest.get(task.taskId);
+		if (!record || !["completed", "failed", "stopped"].includes(record.status)) continue;
+		verified.push({ producer: task.producer, taskId: task.taskId, receiptId: task.receiptId, outcome: record.status as VerifiedTaskReceipt["outcome"], sessionId, evidenceEntryId: record.entryId });
+	}
+	return verified;
+}
+
+/** Copy the goal's active file into the timestamped recovery backup; returns the stamp used. */
+export function backupGoalFileForRecovery(ctx: GoalFileContext, goal: GoalRecord): string {
+	const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+	const relative = activePathForGoal(ctx, goal);
+	ensureGoalStorageDirectory(ctx, `${RECOVERY_BACKUP_DIR}/${stamp}`);
+	fs.copyFileSync(goalStoragePath(ctx, relative), goalStoragePath(ctx, `${RECOVERY_BACKUP_DIR}/${stamp}/${path.posix.basename(relative)}`));
+	return stamp;
 }
 
 /** Read-only recovery report. Never mutates goal storage. */
