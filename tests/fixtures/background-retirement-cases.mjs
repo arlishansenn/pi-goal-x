@@ -36,29 +36,25 @@ test("public ordinary workflow results follow mechanical progress without enroll
 	assert.deepEqual(after.scheduler.backgroundTasks, before);
 });
 
-for (const mode of ["unspent", "mixed-unspent", "mixed", "waiting", "claimed"]) test(`canonical cold retirement ${mode} preserves authorization without replay`, async t => {
+for (const mode of ["unspent", "mixed", "waiting", "claimed"]) test(`canonical cold retirement ${mode} preserves authorization without replay`, async t => {
 	const h = await extensionFixture();
 	t.after(() => h.close());
 	t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1800000000000 });
 	await h.begin();
 	await h.result(producers.subagent.launch("cold"));
 	await h.settle();
-	if (!mode.includes("unspent")) {
-		t.mock.timers.tick(600000);
-		await h.message({ ...h.sent[0], role: "custom" });
-		await h.begin();
-		await h.settle();
-	}
 	const before = await h.goal();
 	const file = path.resolve(h.cwd, before.activePath);
 	const state = before.scheduler;
+	// Issue 10: the old auto policy's task wait ({ deadline, checkAt,
+	// remainingChecks }) is legacy data in every spent/unspent flavor; it is
+	// dropped on load, never re-armed.
 	const oldTask = mode.includes("unspent") ? { ...retired, wait: { ...retired.wait, remainingChecks: 1 } } : retired;
-	if (mode === "mixed-unspent") state.backgroundTasks.tasks[0].wait.checkAt += 20000;
 	state.backgroundTasks.tasks = mode.startsWith("mixed") ? [oldTask, ...state.backgroundTasks.tasks] : [oldTask];
 	state.backgroundTasks.deliveries = [{ deliveryId: "opaque-old", runId: "old-dw", executionEpoch: 2 }];
 	if (mode === "claimed") {
 		state.phase = "claimed";
-		state.dispatch = { id: "old-dispatch", kind: "check", claimedAt: 1800000600000, taskCheck: { targets: [{ producer: retired.producer, taskId: retired.taskId, receiptId: retired.receiptId }] } };
+		state.dispatch = { id: "old-dispatch", kind: "check", claimedAt: 1800000600000 };
 	}
 	const { serializeGoalFile } = await import("../../extensions/storage/goal-files.ts");
 	writeFileSync(file, serializeGoalFile(before));

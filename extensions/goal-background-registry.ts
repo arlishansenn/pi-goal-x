@@ -27,8 +27,14 @@ export interface TrackedTask {
 	outcome?: TaskOutcome;
 	/** The producer's native host report was observed for this task. */
 	hostReported: boolean;
-	/** Allocated at first actual waiting; immutable except remainingChecks. */
-	wait?: { deadline: number; checkAt: number; remainingChecks: 0 | 1 };
+	/**
+	 * Explicit terminal deadline (epoch ms) a verified producer contract
+	 * declared at launch; nicobailon/pi-subagents reports it as an absolute
+	 * `deadlineAt`. Immutable: a repeated receipt never extends it. Absent
+	 * means the wait is event-driven and unbounded; nothing is
+	 * inferred from tool input.
+	 */
+	deadline?: number;
 }
 
 export interface BackgroundTasksState {
@@ -36,9 +42,6 @@ export interface BackgroundTasksState {
 	scope?: { goalId: string; sessionId: string };
 	tasks: readonly TrackedTask[];
 }
-
-export const BACKGROUND_TASK_WAIT_MS = 10 * 60_000;
-const BACKGROUND_TASK_DEADLINE_MARGIN_MS = 60_000;
 
 const NICO_MODES = new Set(["single", "parallel", "chain", "workflow"]);
 
@@ -62,10 +65,22 @@ function producerLaunch(event: TaskResultLike & { toolCallId?: string }): Tracke
 		const results = details.results;
 		if (!NICO_MODES.has(mode) || !asyncId || !asyncDir || !Array.isArray(results) || results.length > 0) return null;
 		const runId = boundedId(details.runId);
+		const deadline = declaredDeadlineAt(details.deadlineAt);
 		return { producer: "nicobailon/pi-subagents", taskId: asyncId, aliases: runId && runId !== asyncId ? [runId] : [],
-			label: `pi-subagents task ${asyncId}`, toolName: event.toolName, receiptId, hostReported: false };
+			label: `pi-subagents task ${asyncId}`, toolName: event.toolName, receiptId, hostReported: false,
+			...(deadline !== undefined ? { deadline } : {}) };
 	}
 	return null;
+}
+
+/**
+ * nicobailon/pi-subagents declares its async deadline as an absolute integer
+ * epoch-ms `details.deadlineAt` (verified native receipts: deadlineAt =
+ * receipt time + timeoutMs). Only that verified shape is honored, exactly as
+ * declared: no tool-input timeout is read and no margin is added.
+ */
+function declaredDeadlineAt(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= 8_640_000_000_000_000 ? value : undefined;
 }
 
 function outcomeOf(status: string): TaskOutcome | undefined {
@@ -124,6 +139,42 @@ export function observeToolResult(
 		return { state: state(), observed };
 	}
 
+	// pstack's stop_agent returns the ended record (agents.ts finish()): the
+	// stop's notice carries triggerTurn false and may never reach a message
+	// event, so the result itself settles the exact structured:agent task it
+	// names. Same scope and id only; anything else settles nothing.
+	if (event.toolName === "stop_agent") {
+		const agentId = boundedId(details?.agentId);
+		const status = typeof details?.status === "string" ? details.status.trim() : "";
+		if (agentId && ["completed", "failed", "stopped"].includes(status)) {
+			tasks = tasks.map(t => {
+				if (!owns(t) || t.producer !== "structured:agent" || t.taskId !== agentId || t.hostReported) return t;
+				return { ...t, outcome: status as TaskOutcome, hostReported: true };
+			});
+			return { state: state(), observed: true };
+		}
+	}
+	// pstack's send_message resumes a finished agent as a new background run
+	// under the same id and promises one completion notice (agents.ts): the
+	// receipt { agentId, running } re-enrolls that agent as running with exact
+	// scope, keeping the earlier terminal evidence only as history.
+	if (event.toolName === "send_message" && typeof details?.running === "boolean") {
+		const agentId = boundedId(details.agentId);
+		if (agentId) {
+			let tracked = false;
+			tasks = tasks.map(t => {
+				if (!owns(t) || t.producer !== "structured:agent" || t.taskId !== agentId) return t;
+				tracked = true;
+				if (!t.hostReported) return t;
+				const { outcome: _ended, ...running } = t;
+				return { ...running, hostReported: false };
+			});
+			if (!tracked) tasks.push({ producer: "structured:agent", taskId: agentId, aliases: [],
+				label: `agent task ${agentId}`, toolName: "agent",
+				receiptId: boundedId(event.toolCallId) || `send_message:${agentId}`, scope: launchScope, hostReported: false });
+			return { state: state(), observed: true };
+		}
+	}
 	const parsedLaunch = producerLaunch(event);
 	const launch = parsedLaunch ? { ...parsedLaunch, scope: launchScope } : null;
 	if (launch) {
@@ -170,6 +221,25 @@ export function observeHostMessage(
 	if (details.sessionId !== undefined && details.sessionId !== sessionId) return { state: current, reported: [] };
 	const reported: TrackedTask[] = [];
 	let tasks = [...current.tasks];
+	// pstack's `agent` end notice (plugins/pstack, customType "pstack-agent"): the
+	// producer reports exactly { agentId, status, exitCode, outputFile } and its
+	// statuses are exactly completed/failed/stopped. The delivery session is the
+	// host context; a supplied foreign sessionId is rejected, and no text is
+	// parsed. It settles only tasks the same session enrolled for pstack's agent
+	// tool (producer structured:agent) with the exact agentId.
+	if (msg.customType === "pstack-agent") {
+		const agentId = boundedId(details.agentId);
+		const status = typeof details.status === "string" ? details.status.trim() : "";
+		if (agentId && ["completed", "failed", "stopped"].includes(status)) {
+			tasks = tasks.map(t => {
+				if ((t.scope ?? current.scope)?.sessionId !== sessionId || t.producer !== "structured:agent" || t.hostReported || t.taskId !== agentId) return t;
+				const updated = { ...t, outcome: status as TaskOutcome, hostReported: true };
+				reported.push(updated);
+				return updated;
+			});
+		}
+		return { state: { ...current, tasks }, reported };
+	}
 	const reports = msg.customType === "subagent-notify" && Array.isArray(details.runs) ? details.runs
 		: msg.customType === "background-task-notification" ? [details] : [];
 	const producer = msg.customType === "subagent-notify" ? "nicobailon/pi-subagents" : "ismailsaleekh/pi-background-tasks";
@@ -254,49 +324,87 @@ export function outstandingTasks(state: BackgroundTasksState | undefined): reado
 	return state.tasks.filter(t => !t.hostReported);
 }
 
-/** Give every outstanding task without a budget its one immutable wait window. */
-export function allocateWaits(state: BackgroundTasksState, now: number): BackgroundTasksState {
-	const tasks = state.tasks.map(t =>
-		!t.hostReported && !t.wait
-			? { ...t, wait: { deadline: now + BACKGROUND_TASK_WAIT_MS + BACKGROUND_TASK_DEADLINE_MARGIN_MS, checkAt: now + BACKGROUND_TASK_WAIT_MS, remainingChecks: 1 as const } }
-			: t,
-	);
-	return { ...state, tasks };
+/** pstack persists one "pstack-agents" session entry per agent state change. */
+export interface PstackAgentRecordEntry {
+	entryId: string;
+	agentId: string;
+	status: string;
+	/** Entry timestamp (epoch ms) for cross-file ordering; NaN when the record carries none. */
+	at: number;
+}
+
+/**
+ * Last-record-per-agent statuses from pstack-agents session entries, oldest to
+ * newest. A later running record supersedes an earlier terminal one; only the
+ * final record per agent counts. The record's own agent.sessionId is the child
+ * session, never the delivery session, so it is not consulted.
+ */
+export function readPstackAgentRecords(entries: readonly unknown[]): Map<string, PstackAgentRecordEntry> {
+	const latest = new Map<string, PstackAgentRecordEntry>();
+	for (const raw of entries) {
+		const entry = asRecord(raw);
+		if (!entry || entry.type !== "custom" || entry.customType !== "pstack-agents") continue;
+		const data = asRecord(entry.data);
+		const agent = asRecord(data?.agent);
+		const agentId = boundedId(agent?.id);
+		const status = typeof data?.status === "string" ? data.status.trim() : "";
+		if (!agentId || !["running", "completed", "failed", "stopped"].includes(status)) continue;
+		const at = [entry.timestamp, (data as { endedAt?: unknown })?.endedAt, agent?.startedAt]
+			.map(value => typeof value === "string" ? Date.parse(value) : Number.NaN)
+			.find(value => Number.isFinite(value)) ?? Number.NaN;
+		latest.set(agentId, { entryId: typeof entry.id === "string" ? entry.id : "", agentId, status, at });
+	}
+	return latest;
+}
+
+/**
+ * Settle outstanding structured:agent tasks whose latest pstack-agents record
+ * is terminal. Covers ends that never raise an extension message event: a
+ * native stop (triggerTurn false) and the orphan stop pstack persists on
+ * reload. `latest` is the accumulated last-record-per-agent map, so a
+ * terminal record scanned before the launch receipt was observed still
+ * settles its task. Idempotent: settled tasks are skipped.
+ */
+export function settleFromPstackRecords(
+	current: BackgroundTasksState | undefined,
+	latest: ReadonlyMap<string, PstackAgentRecordEntry>,
+	sessionId = current?.scope?.sessionId,
+): { state: BackgroundTasksState | undefined; settled: readonly TrackedTask[] } {
+	if (!current || current.tasks.length === 0 || latest.size === 0) return { state: current, settled: [] };
+	const settled: TrackedTask[] = [];
+	const tasks = current.tasks.map(t => {
+		if (t.hostReported || t.producer !== "structured:agent") return t;
+		if ((t.scope ?? current.scope)?.sessionId !== sessionId) return t;
+		const record = latest.get(t.taskId);
+		if (!record || !["completed", "failed", "stopped"].includes(record.status)) return t;
+		const updated = { ...t, outcome: record.status as TaskOutcome, hostReported: true };
+		settled.push(updated);
+		return updated;
+	});
+	if (settled.length === 0) return { state: current, settled: [] };
+	return { state: { ...current, tasks }, settled };
 }
 
 export interface WaitProjection {
-	deadline: number;
-	nextCheckAt?: number;
-	remainingChecks: 0 | 1;
+	/** Earliest producer-declared deadline; absent means the wait is event-driven. */
+	deadline?: number;
 	id: string;
 	label: string;
 }
 
-/** Earliest deadline and earliest unspent check across outstanding budgets. */
+/** Primary outstanding task and its earliest producer-declared deadline. System deadlines are never manufactured. */
 export function projectWait(state: BackgroundTasksState): WaitProjection | undefined {
-	const withWaits = outstandingTasks(state).filter((t): t is TrackedTask & { wait: { deadline: number; checkAt: number; remainingChecks: 0 | 1 } } => t.wait !== undefined);
-	if (withWaits.length === 0) return undefined;
-	const deadline = Math.min(...withWaits.map(t => t.wait.deadline));
-	const checkCandidates = withWaits.filter(t => t.wait.remainingChecks === 1);
-	const nextCheckAt = checkCandidates.length > 0 ? Math.min(...checkCandidates.map(t => t.wait.checkAt)) : undefined;
-	const primary = withWaits.slice().sort((a, b) => a.wait.deadline - b.wait.deadline)[0]!;
+	const pending = outstandingTasks(state);
+	if (pending.length === 0) return undefined;
+	const withDeadlines = pending.filter((t): t is TrackedTask & { deadline: number } => typeof t.deadline === "number");
+	const primary = withDeadlines.length > 0
+		? withDeadlines.slice().sort((a, b) => a.deadline - b.deadline)[0]!
+		: pending[0]!;
 	return {
-		deadline,
-		nextCheckAt,
-		remainingChecks: nextCheckAt === undefined ? 0 : 1,
+		deadline: withDeadlines.length > 0 ? Math.min(...withDeadlines.map(t => t.deadline)) : undefined,
 		id: primary.taskId || primary.receiptId,
-		label: withWaits.length === 1 ? primary.label : `${primary.label} (+${withWaits.length - 1} more)`,
+		label: pending.length === 1 ? primary.label : `${primary.label} (+${pending.length - 1} more)`,
 	};
-}
-
-/** Spend the one check of every task whose check is due at `now`; one dispatch covers all. */
-export function consumeDueChecks(state: BackgroundTasksState, now: number): BackgroundTasksState {
-	const tasks = state.tasks.map(t =>
-		t.wait && t.wait.remainingChecks === 1 && t.wait.checkAt <= now
-			? { ...t, wait: { ...t.wait, remainingChecks: 0 as const } }
-			: t,
-	);
-	return { ...state, tasks };
 }
 
 /** Fail-closed validation: corrupt data interrupts scheduling, it never grants a fresh set. */
@@ -315,6 +423,11 @@ export function normalizeBackgroundTasks(raw: unknown): BackgroundTasksState | u
 		const t = asRecord(item);
 		if (t?.producer === "@quintinshaw/pi-dynamic-workflows") continue;
 		if (!t || typeof t.producer !== "string" || !t.producer || typeof t.taskId !== "string" || typeof t.label !== "string" || typeof t.toolName !== "string" || typeof t.receiptId !== "string" || typeof t.hostReported !== "boolean") return "invalid";
+		// A task wait of the old auto policy ({ deadline, checkAt,
+		// remainingChecks }) was system-made and no longer authorizes anything;
+		// it is dropped, never rejected, so identities and audit data survive.
+		if (t.wait !== undefined && asRecord(t.wait) === null) return "invalid";
+		if (t.deadline !== undefined && (typeof t.deadline !== "number" || !Number.isSafeInteger(t.deadline) || t.deadline <= 0 || t.deadline > 8_640_000_000_000_000)) return "invalid";
 		let taskScope: TrackedTask["scope"];
 		if (t.scope !== undefined) {
 			const rawScope = asRecord(t.scope);
@@ -322,10 +435,6 @@ export function normalizeBackgroundTasks(raw: unknown): BackgroundTasksState | u
 			taskScope = { goalId: rawScope.goalId, sessionId: rawScope.sessionId };
 		}
 		if (t.outcome !== undefined && !["completed", "failed", "paused", "stopped"].includes(String(t.outcome))) return "invalid";
-		if (t.wait !== undefined) {
-			const w = asRecord(t.wait);
-			if (!w || !Number.isFinite(w.deadline) || !Number.isFinite(w.checkAt) || ![0, 1].includes(w.remainingChecks as number)) return "invalid";
-		}
 		tasks.push({
 			producer: (["structured:bg_run", "structured:bg_status"].includes(t.producer) ? "ismailsaleekh/pi-background-tasks" : t.producer) as ProducerId, taskId: t.taskId,
 			aliases: Array.isArray(t.aliases) ? t.aliases.map(String) : [],
@@ -333,7 +442,7 @@ export function normalizeBackgroundTasks(raw: unknown): BackgroundTasksState | u
 			outcome: t.outcome as TaskOutcome | undefined,
 			...(taskScope ? { scope: taskScope } : {}),
 			hostReported: t.hostReported,
-			wait: t.wait as TrackedTask["wait"],
+			...(t.deadline !== undefined ? { deadline: t.deadline } : {}),
 		});
 	}
 	return { version: 1, ...(scope ? { scope } : {}), tasks };

@@ -18,10 +18,11 @@ test("native background snapshot preserves a sibling's original budget through p
 	const tasks = (await h.goal()).scheduler.backgroundTasks.tasks;
 	assert.equal(tasks.find(task => task.taskId === "fast")?.outcome, "failed");
 	assert.equal(tasks.find(task => task.taskId === "fast")?.hostReported, true);
-	assert.equal(tasks.find(task => task.taskId === "slow")?.hostReported, false);
-	assert.equal(tasks.find(task => task.taskId === "slow")?.wait.deadline, 1800000660000);
+	assert.equal(tasks.find(task => task.taskId === "slow")?.hostReported, false, "the sibling keeps waiting on its own report");
+	assert.equal(tasks.find(task => task.taskId === "slow")?.wait, undefined, "issue 10: no system budget is attached");
 	t.mock.timers.tick(660000);
-	assert.equal((await h.goal()).status, "paused");
+	assert.equal((await h.goal()).status, "active", "no manufactured deadline pauses the goal");
+	assert.equal((await h.goal()).scheduler.backgroundTasks.tasks.find(task => task.taskId === "slow")?.hostReported, false, "the sibling is never settled by elapsed time");
 });
 
 test("ordinary user cannot release generic wait or refresh its deadline", async t => {
@@ -36,8 +37,9 @@ test("ordinary user cannot release generic wait or refresh its deadline", async 
 	await h.message({ role: "user", content: "Background task updates." });
 	await h.begin();
 	await h.settle();
-	assert.equal((await h.goal()).scheduler.backgroundTasks.tasks[0].hostReported, false);
-	assert.equal((await h.goal()).scheduler.wait.deadline, 1800000660000);
+	assert.equal((await h.goal()).scheduler.backgroundTasks.tasks[0].hostReported, false, "user text cannot release the wait");
+	assert.equal((await h.goal()).scheduler.wait.deadline, undefined, "issue 10: no system deadline exists to refresh");
+	assert.equal((await h.goal()).scheduler.wait.taskId, "one", "the task wait survives the user takeover");
 	t.mock.timers.tick(537000);
-	assert.equal((await h.goal()).status, "paused");
+	assert.equal((await h.goal()).status, "active", "no manufactured deadline pauses the goal");
 });

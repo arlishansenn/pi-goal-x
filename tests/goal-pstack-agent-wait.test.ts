@@ -1,6 +1,6 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -19,19 +19,22 @@ import { readGoalLedger } from "../extensions/goal-ledger.ts";
  * "pstack-agent" with details { agentId, status, exitCode, outputFile }, and a
  * stop sends it with triggerTurn=false, which pi appends without an extension
  * message event. Every end persists a "pstack-agents" session entry first.
+ * The only producer-declared task deadline is nicobailon/pi-subagents'
+ * absolute integer `details.deadlineAt` (verified native receipts); tool-input
+ * timeouts are never read and no system deadline or check is manufactured.
  */
 
 const NOW = 1_800_000_000_000;
 const OWNER = "owner-1";
 
-interface FixtureOptions { owner?: string; prepare?: (goal: GoalRecord) => void; confirm?: boolean }
+interface FixtureOptions { owner?: string; prepare?: (goal: GoalRecord) => void; confirm?: boolean; onConfirm?: (title: string, message: string) => unknown; settings?: Record<string, unknown> }
 
 async function fixture(t: TestContext, options: FixtureOptions = {}) {
 	const cwd = mkdtempSync(path.join(tmpdir(), "pgx-pstack-"));
 	const sessionDir = path.join(cwd, "sessions");
 	mkdirSync(sessionDir, { recursive: true });
 	mkdirSync(path.join(cwd, ".pi"), { recursive: true });
-	writeFileSync(path.join(cwd, ".pi", "pi-goal-x-settings.json"), JSON.stringify({ strictExecutionContract: false }));
+	writeFileSync(path.join(cwd, ".pi", "pi-goal-x-settings.json"), JSON.stringify({ strictExecutionContract: false, ...options.settings }));
 	const prior = process.env.PI_GOAL_GLOBAL_SETTINGS_FILE;
 	process.env.PI_GOAL_GLOBAL_SETTINGS_FILE = path.join(cwd, "absent-global.json");
 	invalidateGoalSettingsCache();
@@ -61,7 +64,7 @@ async function fixture(t: TestContext, options: FixtureOptions = {}) {
 		cwd, hasUI: false, isIdle: () => true, hasPendingMessages: () => false, abort: () => {},
 		getSystemPrompt: () => "base",
 		sessionManager: { getSessionId: () => options.owner ?? OWNER, getSessionDir: () => sessionDir, getCwd: () => cwd, getRoot: () => cwd, getBranch: () => branch },
-		ui: { notify: (message: string) => notifications.push(message), setStatus: () => {}, setWidget: () => {}, confirm: async () => options.confirm ?? true },
+		ui: { notify: (message: string) => notifications.push(message), setStatus: () => {}, setWidget: () => {}, confirm: async (title: string, message: string) => { await options.onConfirm?.(title, message); return options.confirm ?? true; } },
 	} as unknown as ExtensionContext;
 	goalExtension(pi as any);
 	const core = (pi as any)._goalCore as GoalCore;
@@ -90,10 +93,17 @@ async function fixture(t: TestContext, options: FixtureOptions = {}) {
 		data: { agent: { id: agentId, description: "delegate", subagentType: "general", sessionId: `child-${agentId}`, sessionDir, cwd, startedAt: new Date(NOW).toISOString() },
 			status, exitCode: status === "completed" ? 0 : null, endedAt: new Date(NOW).toISOString(), finalText: "done" },
 	});
+	const nico = (runId: string, extra: Record<string, unknown> = {}) => handlers.tool_result!({
+		toolName: "subagent", toolCallId: `launch-${runId}`, isError: false,
+		input: { agent: "delegate", task: "work", async: true },
+		details: { mode: "single", runId, asyncId: runId, asyncDir: `/tmp/async-subagent-runs/${runId}`, results: [], context: "fresh", timeoutMs: 1800000, ...extra },
+		content: [{ type: "text", text: `Async: delegate [${runId}]` }],
+	}, ctx);
 	const run = async (fn: () => unknown) => { core.scheduler.begin(ctx); await fn(); core.scheduler.settled(ctx); };
 	const current = () => core.state.goal!;
 	const command = (name: string, args = "") => commands.get(name)!.handler(args, ctx);
-	return { cwd, ctx, core, sent, notifications, branch, sessionDir, launch, notice, agentRecord, run, current, command };
+	const result = (event: Record<string, unknown>) => handlers.tool_result!(event, ctx);
+	return { cwd, ctx, core, sent, notifications, branch, sessionDir, launch, notice, agentRecord, nico, run, current, command, result };
 }
 
 function pausedWithTasks(goal: GoalRecord, tasks: Record<string, unknown>[], owner: string, sessionId = owner): void {
@@ -166,19 +176,33 @@ test("an undeclared task waits past eleven minutes without a manufactured deadli
 	assert.equal(h.sent.length, 0, "no polling run is dispatched");
 });
 
-test("an explicit timeout bounds the wait and no later wait renews it", async t => {
+test("a producer-declared deadlineAt bounds the wait and nothing renews it", async t => {
 	const h = await fixture(t);
-	await h.run(() => h.launch("a-1", { timeoutMs: 120_000 }));
-	assert.equal(h.current().scheduler?.wait?.deadline, NOW + 120_000, "the declared runtime is the deadline, without a margin");
+	await h.run(() => h.nico("n-1", { deadlineAt: NOW + 120_000 }));
+	assert.equal(h.current().scheduler?.wait?.taskId, "n-1");
+	assert.equal(h.current().scheduler?.wait?.deadline, NOW + 120_000, "the verified absolute deadlineAt is the deadline, without a margin");
 	t.mock.timers.tick(60_000);
 	h.core.scheduler.message(h.ctx, { role: "user", content: "keep going" });
-	await h.run(() => h.launch("a-1", { timeoutMs: 600_000 }));
+	await h.run(() => h.nico("n-1", { deadlineAt: NOW + 600_000 }));
 	assert.equal(h.current().scheduler?.wait?.deadline, NOW + 120_000, "a repeated receipt or a new wait does not renew it");
 	t.mock.timers.tick(59_999);
 	assert.equal(h.current().status, "active");
 	t.mock.timers.tick(1);
 	assert.equal(h.current().status, "paused");
 	assert.match(h.current().pauseReason ?? "", /deadline/i);
+});
+
+test("no deadline is invented: tool input timeouts and invalid deadlineAt values are ignored", async t => {
+	const h = await fixture(t);
+	await h.run(() => h.launch("a-1", { timeoutMs: 120_000 }));
+	assert.equal(h.current().scheduler?.wait?.deadline, undefined, "a tool-input timeoutMs is not a wait contract");
+	await h.run(() => h.nico("n-bad", { deadlineAt: "soon" }));
+	await h.run(() => h.nico("n-neg", { deadlineAt: -1 }));
+	const waits = h.current().scheduler?.backgroundTasks?.tasks ?? [];
+	assert.equal(waits.find(task => task.taskId === "n-bad")?.deadline, undefined, "a non-integer deadlineAt is not adopted");
+	assert.equal(waits.find(task => task.taskId === "n-neg")?.deadline, undefined, "a negative deadlineAt is not adopted");
+	t.mock.timers.tick(2 * 60 * 60_000);
+	assert.equal(h.current().status, "active", "undeclared work waits event-driven");
 });
 
 test("a native stop without an extension message retires the task from its session record", async t => {
@@ -193,6 +217,51 @@ test("a native stop without an extension message retires the task from its sessi
 	t.mock.timers.tick(1);
 	assert.equal(h.current().scheduler?.phase === "waiting", false, "the goal does not wait on a stopped task");
 	assert.equal(h.sent.length, 1, "the goal continues");
+});
+
+test("send_message re-enrolls the agent run and the old terminal record cannot settle it", async t => {
+	const h = await fixture(t);
+	await h.run(() => h.launch("a-1"));
+	h.core.scheduler.message(h.ctx, h.notice("a-1", "completed"));
+	assert.deepEqual(h.core.scheduler.pendingBackgroundTasks(), []);
+	// send_message to a finished agent starts a new background run under the
+	// same id (agents.ts): the receipt re-enrolls it, and the earlier terminal
+	// session record must not settle the new run.
+	await h.run(() => h.core.scheduler.noteToolResult(h.ctx, { toolName: "send_message", toolCallId: "send-1", input: { to: "a-1", message: "again" }, details: { agentId: "a-1", running: false }, isError: false }));
+	assert.deepEqual(h.core.scheduler.pendingBackgroundTasks().map(task => task.id), ["a-1"], "the new run is tracked again under the same id");
+	t.mock.timers.tick(10_000);
+	assert.deepEqual(h.core.scheduler.pendingBackgroundTasks().map(task => task.id), ["a-1"], "the old completed record in the map never settles the new run");
+	h.branch.push(h.agentRecord("a-1", "running"), h.agentRecord("a-1", "failed"));
+	h.core.scheduler.restore(h.ctx);
+	t.mock.timers.tick(1);
+	assert.deepEqual(h.core.scheduler.pendingBackgroundTasks(), [], "the new run's own terminal record settles it");
+	assert.equal(h.current().scheduler?.backgroundTasks?.tasks[0]?.outcome, "failed");
+	t.mock.timers.tick(1);
+	assert.equal(h.sent.length, 1, "the goal continues");
+});
+
+test("a terminal record already in the session prevents an eternal wait", async t => {
+	const h = await fixture(t);
+	h.branch.push(h.agentRecord("a-early", "completed"));
+	await h.run(() => h.launch("a-early"));
+	assert.deepEqual(h.core.scheduler.pendingBackgroundTasks(), [], "the record scanned at settlement retires the task at once; no wait is raised");
+	t.mock.timers.tick(1);
+	assert.equal(h.current().status, "active");
+	assert.equal(h.sent.length, 1, "the goal continues");
+});
+
+test("a stop_agent result settles its agent even when the goal pauses in the same turn", async t => {
+	const h = await fixture(t);
+	await h.run(() => h.launch("a-1"));
+	h.branch.push(h.agentRecord("a-1", "stopped"));
+	// The real sequence: the tool_result event fires, then the model pauses the
+	// goal with update_goal before any settlement could scan.
+	await h.result({ toolName: "stop_agent", toolCallId: "stop-1", input: { id: "a-1" }, details: { agentId: "a-1", status: "stopped" }, isError: false, content: [{ type: "text", text: "stopped" }] });
+	h.core.pauseActiveGoal(h.ctx);
+	assert.deepEqual(h.core.scheduler.pendingBackgroundTasks(), [], "the stop result settles the agent it names");
+	const task = h.current().scheduler?.backgroundTasks?.tasks[0];
+	assert.equal(task?.hostReported, true);
+	assert.equal(task?.outcome, "stopped");
 });
 
 test("a session record names only its own agent; a later running record reopens nothing it settled", async t => {
@@ -259,12 +328,40 @@ test("/goal-resume of an issue-10 goal retires the reported task and stays activ
 	assert.ok(h.notifications.some(message => /Goal resumed/.test(message)));
 });
 
-test("/goal-resume reports no success when the goal re-pauses at once", async t => {
-	const h = await fixture(t, { prepare: goal => pausedWithTasks(goal, [{ ...legacyTask("a-1"), wait: undefined, deadline: NOW - 1 }], OWNER) });
+test("/goal-resume stays truthful while the agent still runs", async t => {
+	const h = await fixture(t, { prepare: goal => pausedWithTasks(goal, [legacyTask("a-1")], OWNER) });
+	h.branch.push(h.agentRecord("a-1", "running"));
 	await h.command("goal-resume");
-	assert.equal(h.current().status, "paused", "an expired explicit deadline still pauses");
+	t.mock.timers.tick(1);
+	assert.equal(h.current().status, "active", "resume continues the goal");
+	assert.deepEqual(h.core.scheduler.pendingBackgroundTasks().map(task => task.id), ["a-1"], "a still-running agent is not faked complete");
+	assert.ok(h.notifications.some(message => /Goal resumed/.test(message)));
+});
+
+test("/goal-resume after an expired producer deadlineAt reports the deadline, not success", async t => {
+	const h = await fixture(t);
+	await h.run(() => h.nico("n-1", { deadlineAt: NOW + 120_000 }));
+	t.mock.timers.tick(120_000);
+	assert.equal(h.current().status, "paused");
+	const goalFile = path.resolve(h.cwd, h.current().activePath!);
+	const before = readFileSync(goalFile, "utf8");
+	const sentBefore = h.sent.length;
+	await h.command("goal-resume");
+	t.mock.timers.tick(1);
+	assert.equal(h.current().status, "paused", "an expired explicit producer deadline still blocks the resume");
+	assert.equal(readFileSync(goalFile, "utf8"), before, "the refused resume writes nothing; the task keeps its identity and deadline");
+	assert.equal(h.sent.length, sentBefore, "no kickoff run is dispatched only to re-pause at settle");
 	assert.ok(!h.notifications.some(message => /Goal resumed/.test(message)), h.notifications.join("\n"));
-	assert.ok(h.notifications.some(message => /deadline/i.test(message)));
+	assert.ok(h.notifications.some(message => /deadline/i.test(message) && message.includes(new Date(NOW + 120_000).toISOString())), h.notifications.join("\n"));
+	assert.ok(!readGoalLedger(h.ctx).events.some(event => event.type === "goal_resumed"), "no resume is recorded");
+});
+
+test("/goal-resume reports no success when continuation is disabled", async t => {
+	const h = await fixture(t, { settings: { maxAutonomousRuns: 0 }, prepare: goal => pausedWithTasks(goal, [legacyTask("a-1")], OWNER) });
+	h.branch.push(h.agentRecord("a-1", "completed"));
+	await h.command("goal-resume");
+	assert.equal(h.current().status, "paused", "a disabled allowance changes nothing");
+	assert.ok(!h.notifications.some(message => /Goal resumed/.test(message)), h.notifications.join("\n"));
 	assert.ok(!readGoalLedger(h.ctx).events.some(event => event.type === "goal_resumed"), "no resume is recorded");
 });
 

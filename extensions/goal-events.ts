@@ -115,7 +115,7 @@ export function registerGoalEvents(core: GoalCore): void {
 		// pi reports the result on its own and the goal wakes for it.
 		// The pinned pi API carries tool arguments on `input` (ToolCallEventBase),
 		// never on `args`.
-		if (core.scheduler.blocksTaskPoll(ctx, event.toolName, event.input, event.toolCallId)) {
+		if (core.scheduler.blocksTaskPoll(ctx, event.toolName, event.input)) {
 			return {
 				block: true,
 				reason: `The goal is waiting on this background task, and its result is reported automatically. ` +

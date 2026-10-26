@@ -5,7 +5,13 @@ export interface GoalWait {
 	id: string;
 	token: string;
 	reason: string;
-	deadline: number;
+	/**
+	 * Explicit deadline (epoch ms). A caller-declared wait always carries one.
+	 * A system wait raised for a detected background task carries one only when
+	 * the launch declared a timeout; otherwise the wait is
+	 * event-driven and unbounded.
+	 */
+	deadline?: number;
 	/**
 	 * Set only on a wait the runtime raised for a detected background task. It
 	 * marks the wait as system-managed: it does not put the goal under the
@@ -27,10 +33,7 @@ export interface GoalSchedulerState {
 	phase: "idle" | "ready" | "waiting" | "claimed" | "running" | "interrupted";
 	decision?: { kind: "ready"; purpose: GoalDispatchKind } | { kind: "wait" };
 	wait?: GoalWait;
-	dispatch?: { id: string; kind: GoalDispatchKind; claimedAt: number; taskCheck?: {
-		targets: { producer: string; taskId: string; receiptId: string }[];
-		admission?: { toolCallId: string; toolName: string; input: string; completed: boolean };
-	} };
+	dispatch?: { id: string; kind: GoalDispatchKind; claimedAt: number };
 	repairUsed: boolean;
 	/**
 	 * Set when this run did work after it recorded a detached task. Settlement
@@ -68,31 +71,39 @@ export function normalizeGoalScheduler(raw: unknown, goalId?: string): GoalSched
 	if (s.decision && (s.decision.kind !== "wait" && (s.decision.kind !== "ready" || !["ready", "repair", "kickoff", "recovery"].includes(s.decision.purpose)))) return invalid();
 	if (s.wait) {
 		const w = s.wait;
-		if (!text(w.id) || !text(w.token) || !text(w.reason) || (!integer(w.deadline) || w.deadline > 8_640_000_000_000_000)) return invalid();
+		const taskWait = w.taskId !== undefined;
+		if (!text(w.id) || !text(w.token) || !text(w.reason)) return invalid();
 		if (w.taskId !== undefined && !text(w.taskId)) return invalid();
-		if (w.intervalMs !== undefined && (!integer(w.intervalMs) || w.intervalMs < 1000 || !integer(w.remainingChecks) || (w.remainingChecks === 0 ? w.nextCheckAt !== undefined && !integer(w.nextCheckAt) : !integer(w.nextCheckAt)))) return invalid();
-		if (w.intervalMs === undefined && (w.remainingChecks !== undefined || w.nextCheckAt !== undefined)) return invalid();
+		if (w.deadline !== undefined && (!integer(w.deadline) || w.deadline > 8_640_000_000_000_000)) return invalid();
+		// A caller-declared wait keeps its explicit deadline; a task wait without
+		// one is event-driven.
+		if (!taskWait && w.deadline === undefined) return invalid();
+		if (!taskWait && w.intervalMs !== undefined && (!integer(w.intervalMs) || w.intervalMs < 1000 || !integer(w.remainingChecks) || (w.remainingChecks === 0 ? w.nextCheckAt !== undefined && !integer(w.nextCheckAt) : !integer(w.nextCheckAt)))) return invalid();
+		if (!taskWait && w.intervalMs === undefined && (w.remainingChecks !== undefined || w.nextCheckAt !== undefined)) return invalid();
 		if (w.signalled !== undefined && typeof w.signalled !== "boolean") return invalid();
 	}
 	if (s.dispatch && (!text(s.dispatch.id) || !integer(s.dispatch.claimedAt) || !["ready", "check", "wake", "repair", "kickoff", "recovery"].includes(s.dispatch.kind))) return invalid();
-	if (s.dispatch?.taskCheck) {
-		const check = s.dispatch.taskCheck;
-		if (s.dispatch.kind !== "check" || !Array.isArray(check.targets) || check.targets.length === 0 || check.targets.some(t => !t || !text(t.producer) || typeof t.taskId !== "string" || !text(t.receiptId))) return invalid();
-		const a = check.admission;
-		if (a && (!text(a.toolCallId) || !text(a.toolName) || typeof a.input !== "string" || typeof a.completed !== "boolean")) return invalid();
-	}
 	if ((s.phase === "claimed" || s.phase === "running") && !s.dispatch) return invalid();
 	if (s.phase === "ready" && s.decision?.kind !== "ready") return invalid();
 	if (s.phase === "waiting" && (!s.wait || s.decision?.kind !== "wait")) return invalid();
 	const normalized = structuredClone(s) as GoalSchedulerState;
 	if (s.backgroundTasks !== undefined) normalized.backgroundTasks = structuredClone(backgroundTasks);
-	if (normalized.wait?.taskId !== undefined && backgroundTasks && s.backgroundTasks && backgroundTasks.tasks.length < s.backgroundTasks.tasks.length) {
-		// Retired identities lose their check opportunities, not the standing deadline.
-		const projection = projectWait(backgroundTasks);
-		normalized.wait.remainingChecks = projection?.remainingChecks ?? 0;
-		normalized.wait.nextCheckAt = projection?.nextCheckAt;
+	if (normalized.wait?.taskId !== undefined) {
+		// Migration: a task wait keeps only what the tracked tasks
+		// declare. The old system-made deadline/check budget is not authoritative
+		// and is dropped; the deadline is re-derived from the explicit task
+		// deadlines so identities and spent allowance survive untouched.
+		delete normalized.wait.intervalMs;
+		delete normalized.wait.remainingChecks;
+		delete normalized.wait.nextCheckAt;
+		const projection = backgroundTasks ? projectWait(backgroundTasks) : undefined;
+		if (projection?.deadline !== undefined) normalized.wait.deadline = projection.deadline;
+		else delete normalized.wait.deadline;
 	}
 	if (normalized.wait?.remainingChecks === 0) delete normalized.wait.nextCheckAt;
+	// Legacy dispatch payloads carried a taskCheck admission grant of the old
+	// auto-check policy; it no longer authorizes anything and is stripped.
+	if (normalized.dispatch && "taskCheck" in normalized.dispatch) delete (normalized.dispatch as Record<string, unknown>).taskCheck;
 	if (normalized.backgroundTasks && goalId) {
 		const scope = normalized.backgroundTasks.scope;
 		if (scope && scope.goalId !== goalId) return invalid();
@@ -118,11 +129,11 @@ export function schedulerSummaryParts(s: GoalSchedulerState | undefined, limit?:
 	// task wait is not a regime change, so extra rows would be head-sliced away.
 	const taskWait = s?.wait && s.wait.taskId !== undefined ? s.wait : undefined;
 	const runsLine = limit !== undefined && showRuns ? `Autonomous runs: ${s?.used ?? 0}/${limit}${limit === 0 ? " (automatic continuation disabled)" : ""}.` : "";
-	const runs = (runsLine ? runsLine + " " : "") + (taskWait ? `${taskWait.reason}${taskWait.nextCheckAt !== undefined ? ` Next check ${new Date(taskWait.nextCheckAt).toISOString()}.` : ""}` : "");
+	const runs = (runsLine ? runsLine + " " : "") + (taskWait ? `${taskWait.reason}${taskWait.deadline !== undefined ? ` Deadline ${new Date(taskWait.deadline).toISOString()}.` : ""}` : "");
 	const lines: string[] = [];
 	if (s) {
 		if (s.wait && !taskWait) {
-			lines.push(`Waiting: ${s.wait.reason}; wait_id=${s.wait.id}; deadline=${new Date(s.wait.deadline).toISOString()}.`);
+			lines.push(`Waiting: ${s.wait.reason}; wait_id=${s.wait.id}; deadline=${s.wait.deadline !== undefined ? new Date(s.wait.deadline).toISOString() : "none"}.`);
 			if (s.wait.nextCheckAt !== undefined) lines.push(`Next check: ${new Date(s.wait.nextCheckAt).toISOString()}; ${s.wait.remainingChecks} checks remaining.`);
 		}
 		if (s.phase === "interrupted" || s.phase === "claimed") lines.push("Execution requires dispatch admission or explicit /goal-resume after interruption.");

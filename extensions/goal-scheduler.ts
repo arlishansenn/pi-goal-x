@@ -6,8 +6,8 @@ import { budgetReached } from "./goal-accounting.ts";
 import { loadGoalSettings, invalidateGoalSettingsCache } from "./goal-settings.ts";
 import { newGoalScheduler, schedulerSummary, type GoalContinuation, type GoalSchedulerState } from "./goal-scheduler-state.ts";
 import {
-	allocateWaits, consumeDueChecks, isTaskPoll, observeHostMessage, observeToolResult,
-	outstandingTasks, projectWait, type BackgroundTasksState,
+	isTaskPoll, observeHostMessage, observeToolResult, outstandingTasks, projectWait, readPstackAgentRecords,
+	settleFromPstackRecords, type BackgroundTasksState, type PstackAgentRecordEntry,
 } from "./goal-background-registry.ts";
 import { type BackgroundTaskRef, type TaskResultLike } from "./goal-background-task.ts";
 import { invalidateGoalPoolCache } from "./storage/goal-files.ts";
@@ -17,11 +17,14 @@ import { CORE_GOAL_TOOL_NAMES } from "./goal-tool-names.ts";
 const BOOKKEEPING_TOOL_NAMES = new Set<string>(CORE_GOAL_TOOL_NAMES);
 
 /**
- * How long a task wait sleeps before the scheduled re-check, in milliseconds.
- * The wait is event-driven: this interval only covers a result report that
- * never arrives.
+ * While a task wait sleeps, its producer evidence is re-read from the session
+ * branch: pstack ends that carry triggerTurn=false (a native stop, an orphan
+ * stop persisted on reload) never raise a message event. The first poll is
+ * immediate so a reload that races the producer's own restore is caught at
+ * once; later polls back off to POLL_MAX_MS so an idle wait costs nothing.
  */
-export const BACKGROUND_TASK_WAIT_MS = 10 * 60_000;
+const RECORD_POLL_FIRST_MS = 1;
+const RECORD_POLL_MAX_MS = 60_000;
 
 /** Scheduling intent is durable; timers only arrange an opportunity to claim it. */
 export class GoalScheduler {
@@ -36,6 +39,11 @@ export class GoalScheduler {
 	private toolScopes = new Map<string, { goalId: string | null; owner: string }>();
 	private unsubscribe: (() => void) | undefined;
 	private core: GoalCore;
+	/** Cursor over the session entries for incremental pstack record scans. */
+	private recordScan: { cursor: number; length: number; lastId: unknown } | undefined;
+	/** Accumulated last pstack-agents record per agent, across scans. */
+	private recordStatus = new Map<string, PstackAgentRecordEntry>();
+	private pollDelayMs: number | undefined;
 	constructor(core: GoalCore) { this.core = core; }
 
 	private owner(ctx: ExtensionContext): string { return ctx.sessionManager.getSessionId() || "unknown-session"; }
@@ -167,17 +175,64 @@ export class GoalScheduler {
 		this.core.clearActiveAccounting();
 		ctx.ui.notify(reason, "warning");
 	}
-	private taskDeadline(ctx: ExtensionContext): number | undefined {
-		const tasks = this.background(ctx);
-		return tasks ? projectWait(tasks)?.deadline : undefined;
+	/** Entries appended to the session since the last scan; append-only sessions are read once. */
+	private freshSessionEntries(ctx: ExtensionContext): readonly unknown[] {
+		let entries: readonly unknown[];
+		try {
+			const manager = ctx.sessionManager as { getEntries?: () => unknown[]; getBranch?: () => unknown[] };
+			entries = manager.getEntries?.() ?? manager.getBranch?.() ?? [];
+		} catch { return []; }
+		if (!Array.isArray(entries) || entries.length === 0) { this.recordScan = undefined; this.recordStatus.clear(); return []; }
+		const lastId = (entries[entries.length - 1] as { id?: unknown } | undefined)?.id;
+		// A shorter or rewritten session (tree navigation) restarts from the beginning.
+		if (this.recordScan && (entries.length < this.recordScan.length || (entries.length === this.recordScan.length && lastId !== this.recordScan.lastId))) {
+			this.recordScan = undefined;
+			this.recordStatus.clear();
+		}
+		const fresh = entries.slice(this.recordScan?.cursor ?? 0);
+		this.recordScan = { cursor: entries.length, length: entries.length, lastId };
+		for (const record of readPstackAgentRecords(fresh).values()) this.recordStatus.set(record.agentId, record);
+		return fresh;
 	}
-	private guardTaskDeadline(ctx: ExtensionContext): void {
-		const deadline = this.taskDeadline(ctx);
-		if (deadline === undefined || !this.canWaitForTask()) return;
-		this.later(ctx, deadline - Date.now(), () => {
-			const current = this.taskDeadline(ctx);
-			if (current !== undefined && current <= Date.now() && this.canWaitForTask()) this.pause(ctx, "Wait deadline reached.");
-		});
+
+	/** Keep a live task wait pointed at the surviving projection of its tasks. */
+	private refreshTaskWait(s: GoalSchedulerState): void {
+		if (s.phase !== "waiting" || s.wait?.taskId === undefined || !s.backgroundTasks) return;
+		const projection = projectWait(s.backgroundTasks);
+		if (projection) {
+			s.wait.taskId = projection.id;
+			s.wait.reason = `Waiting for ${projection.label} to finish.`;
+			if (projection.deadline !== undefined) s.wait.deadline = projection.deadline;
+			else delete s.wait.deadline;
+		} else delete s.wait.deadline;
+	}
+
+	/**
+	 * Settle outstanding tasks from the accumulated pstack-agents session
+	 * records. Covers ends that never raise a message event: a native stop
+	 * (triggerTurn false) and the orphan stop pstack persists when a session
+	 * that started an agent ends or reloads. The map survives scans, so a
+	 * terminal record observed before the launch receipt still settles its
+	 * task. No write happens unless a task actually settles.
+	 */
+	private scanProducerRecords(ctx: ExtensionContext): void {
+		const current = this.background(ctx);
+		if (!current || !outstandingTasks(current).some(t => t.producer === "structured:agent")) return;
+		this.freshSessionEntries(ctx);
+		if (this.recordStatus.size === 0) return;
+		if (settleFromPstackRecords(current, this.recordStatus, this.owner(ctx)).settled.length === 0) return;
+		this.safe(ctx, () => this.changeBackground(ctx, s => {
+			const observed = settleFromPstackRecords(s.backgroundTasks, this.recordStatus, this.owner(ctx));
+			if (observed.settled.length === 0) return;
+			s.backgroundTasks = observed.state;
+			this.refreshTaskWait(s);
+		}));
+	}
+
+	/** Backoff for record re-reads while a task wait sleeps; resets on each new wait. */
+	private nextPollDelay(): number {
+		this.pollDelayMs = Math.min(this.pollDelayMs === undefined ? RECORD_POLL_FIRST_MS : this.pollDelayMs * 2, RECORD_POLL_MAX_MS);
+		return this.pollDelayMs;
 	}
 	private allowanceReason(ctx: ExtensionContext): string {
 		return this.limit(ctx) === 0 ? "Automatic continuation disabled by maxAutonomousRuns=0. Change the setting in /goal-settings, then use /goal-resume." : "Autonomous-run allowance exhausted. Increase or remove maxAutonomousRuns, or use /goal-resume to renew.";
@@ -202,16 +257,12 @@ export class GoalScheduler {
 		if (!this.canWaitForTask() && !current) return null;
 		const initialTasks: BackgroundTasksState = { version: 1, scope: { goalId: this.core.state.goal!.id, sessionId: this.owner(ctx) }, tasks: [] };
 		const preview = observeToolResult(current ?? initialTasks, event, this.owner(ctx));
-		if (!preview.observed && (outstandingTasks(current).length === 0 || BOOKKEEPING_TOOL_NAMES.has(event.toolName) || isTaskPoll(current, event.toolName, event.input))) {
-			if (!this.core.state.goal?.scheduler?.dispatch?.taskCheck?.admission) return null;
-		}
+		if (!preview.observed && (outstandingTasks(current).length === 0 || BOOKKEEPING_TOOL_NAMES.has(event.toolName) || isTaskPoll(current, event.toolName, event.input))) return null;
 		let launched: BackgroundTaskRef | null = null;
 		this.safe(ctx, () => {
 			let observedLaunch: BackgroundTaskRef | null = null;
 			this.changeBackground(ctx, s => {
 				const tasks = s.backgroundTasks;
-				const admission = s.dispatch?.taskCheck?.admission;
-				if (admission && isTaskPoll(tasks, event.toolName, event.input)) admission.completed = true;
 				if (!this.canWaitForTask() && !tasks) return;
 				const observation = observeToolResult(tasks ?? initialTasks, event, this.owner(ctx));
 				if (!observation.observed) {
@@ -220,10 +271,16 @@ export class GoalScheduler {
 				}
 				if (!this.canWaitForTask() && observation.launched) return;
 				s.backgroundTasks = observation.state;
+				this.refreshTaskWait(s);
 				if (observation.launched) observedLaunch = { id: observation.launched.taskId, label: observation.launched.label, toolName: observation.launched.toolName };
 			});
 			launched = observedLaunch;
 		});
+		// A send_message receipt starts a new run under an old id: the agent's
+		// earlier terminal record must not settle the re-enrolled run.
+		const receipt = asRecord(event.details);
+		const resumedId = event.toolName === "send_message" && typeof receipt?.agentId === "string" ? receipt.agentId.trim().slice(0, 200) : "";
+		if (resumedId) this.recordStatus.delete(resumedId);
 		return launched;
 	}
 
@@ -242,63 +299,32 @@ export class GoalScheduler {
 	pendingBackgroundTask(): BackgroundTaskRef | null { return this.pendingBackgroundTasks()[0] ?? null; }
 
 	/** Whether a call would wait on a tracked task again instead of ending the turn. */
-	blocksTaskPoll(ctx: ExtensionContext, toolName: string, input: unknown, toolCallId: string): boolean {
-		const tasks = this.background(ctx);
-		if (!this.canWaitForTask() || !isTaskPoll(tasks, toolName, input)) return false;
-		if (this.blockedByFailure(ctx)) return true;
-		let blocked = true;
-		this.safe(ctx, () => {
-			const state = this.core.state.goal?.scheduler;
-			if (state?.phase !== "running" || !state.dispatch?.taskCheck || !toolCallId) return;
-			let admitted = false;
-			this.update(ctx, s => {
-				const check = s.phase === "running" ? s.dispatch?.taskCheck : undefined;
-				if (!check || !s.backgroundTasks || s.owner !== this.owner(ctx)) return;
-				const deadline = projectWait(s.backgroundTasks)?.deadline;
-				if (deadline !== undefined && deadline <= Date.now()) return;
-				const targets = s.backgroundTasks.tasks.filter(t => check.targets.some(target => target.producer === t.producer && target.taskId === t.taskId && target.receiptId === t.receiptId));
-				const matched = targets.filter(t => isTaskPoll({ version: 1, tasks: [t] }, toolName, input));
-				const allMatched = outstandingTasks(s.backgroundTasks).filter(t => isTaskPoll({ version: 1, tasks: [t] }, toolName, input));
-				if (matched.length === 0 || allMatched.some(t => !matched.includes(t))) return;
-				const serialized = JSON.stringify(input);
-				if (check.admission) {
-					const a = check.admission;
-					admitted = !a.completed && a.toolCallId === toolCallId && a.toolName === toolName && a.input === serialized;
-				} else {
-					check.admission = { toolCallId, toolName, input: serialized, completed: false };
-					admitted = true;
-				}
-			});
-			blocked = !admitted;
-		});
-		return blocked;
+	blocksTaskPoll(ctx: ExtensionContext, toolName: string, input: unknown): boolean {
+		if (!this.canWaitForTask() || !isTaskPoll(this.background(ctx), toolName, input)) return false;
+		// A repeated poll of an outstanding task never passes, including while
+		// scheduling is blocked on a storage failure (blockedByFailure also keeps
+		// its guard side effects).
+		this.blockedByFailure(ctx);
+		return true;
 	}
 
 	/**
-	 * Sleep until pi reports the pending task's result, with one scheduled
-	 * re-check in case the report never arrives. The standing deadline bounds a
-	 * goal whose report keeps getting lost; once it expires the deadline pause
-	 * governs and no further task wait is raised.
+	 * Sleep until pi reports the pending task's result. The wait is
+	 * event-driven: no deadline or check is manufactured. The only
+	 * deadlines are the caller's own declared waits, which are immutable.
 	 */
 	private deferForTask(ctx: ExtensionContext): void {
-		const now = Date.now();
-		// Budgets are canonical: the first wait allocates them, later waits only
-		// re-project. No re-wait can renew a deadline or check quota.
-		const tasks = allocateWaits(this.background(ctx) ?? { version: 1, tasks: [] }, now);
-		const projection = projectWait(tasks);
+		const projection = projectWait(this.background(ctx) ?? { version: 1, tasks: [] });
 		if (!projection) return;
-		if (projection.deadline <= now) { this.pause(ctx, "Wait deadline reached."); return; }
+		if (projection.deadline !== undefined && projection.deadline <= Date.now()) { this.pause(ctx, "Wait deadline reached."); return; }
+		this.pollDelayMs = undefined;
 		const goal = this.update(ctx, s => {
-			s.backgroundTasks = tasks;
 			s.wait = {
 				id: s.wait?.taskId !== undefined ? s.wait.id : randomUUID(),
 				token: randomUUID(),
 				taskId: projection.id,
 				reason: `Waiting for ${projection.label} to finish.`,
-				deadline: projection.deadline,
-				intervalMs: BACKGROUND_TASK_WAIT_MS,
-				remainingChecks: projection.remainingChecks,
-				nextCheckAt: projection.nextCheckAt,
+				...(projection.deadline !== undefined ? { deadline: projection.deadline } : {}),
 			};
 			s.phase = "waiting"; s.decision = { kind: "wait" }; s.dispatch = undefined; s.generation = randomUUID();
 			s.postTaskProgress = false;
@@ -310,8 +336,6 @@ export class GoalScheduler {
 		// resizes the editor and clips the goal widget for as long as it shows.
 		// The wait is already visible in the widget's scheduling rows and in the
 		// injected state, and it is a routine event, not something to announce.
-		// Arm the re-check. The wait is event-driven, so this timer only covers a
-		// result report that never arrives.
 		this.schedule(ctx);
 	}
 
@@ -334,6 +358,7 @@ export class GoalScheduler {
 		this.attach(ctx);
 		this.inRun = false; this.declared = false; this.runGoalId = undefined;
 		this.cancelTimer();
+		this.pollDelayMs = undefined;
 		this.safe(ctx, () => {
 			this.core.reconcileFocusedGoalFromDisk(ctx);
 			const goal = this.core.state.goal;
@@ -354,14 +379,20 @@ export class GoalScheduler {
 		if (this.limit(ctx) === 0) { ctx.ui.notify(this.allowanceReason(ctx), "warning"); return false; }
 		try {
 			this.cancelTimer();
+			this.pollDelayMs = undefined;
 			this.core.runtime.clearContinuationState();
 			const goalId = this.core.state.goal?.id;
 			if (goalId && this.failures.has(`${this.owner(ctx)}:${goalId}`)) this.core.goalService.beginTurn(ctx, goalId);
 			this.write(ctx, g => {
 				if (g.status === "complete" || budgetReached(g)) throw new Error("A completed or token-budget-limited goal cannot resume.");
+				// A resumed goal would only re-pause on this deadline at its next settle.
+				const wait = g.scheduler?.backgroundTasks ? projectWait(g.scheduler.backgroundTasks) : undefined;
+				if (wait?.deadline !== undefined && wait.deadline <= Date.now()) {
+					throw new Error(`${wait.label} passed its producer deadline (${new Date(wait.deadline).toISOString()}). The goal stays paused until the task reports its result.`);
+				}
 				return { ...g, status: "active", autoContinue: true, stopReason: undefined, pauseReason: undefined, pauseSuggestedAction: undefined,
 					// Resume renews allowance, not task evidence: surviving tasks keep
-					// their identities and already-spent wait budgets.
+					// their identities and terminal evidence.
 					scheduler: { ...newGoalScheduler(this.owner(ctx)), backgroundTasks: g.scheduler?.backgroundTasks, phase: "ready", decision: { kind: "ready", purpose: "kickoff" } } };
 			});
 			this.failures.delete(`${this.owner(ctx)}:${this.core.state.goal?.id}`);
@@ -369,7 +400,9 @@ export class GoalScheduler {
 			// still invalidates it through turn(), just like a declaration.
 			this.declared = this.inRun;
 			this.schedule(ctx);
-			return true;
+			// A resume that immediately re-pauses inside schedule() must reach the
+			// user as the pause it is, not as a resume.
+			return this.core.state.goal?.status === "active";
 		} catch (error) { ctx.ui.notify(String(error), "warning"); return false; }
 	}
 	kickoff(ctx: ExtensionContext): void {
@@ -431,7 +464,7 @@ export class GoalScheduler {
 		this.runGoalId = this.core.state.goal?.id;
 		this.cancelTimer(); this.core.runtime.clearContinuationTimer();
 		this.core.runningGoalId = this.core.state.goal?.id ?? null;
-		if (!this.blockedByFailure(ctx)) this.guardTaskDeadline(ctx);
+		if (!this.blockedByFailure(ctx)) this.scanProducerRecords(ctx);
 	}
 	turn(ctx: ExtensionContext): void {
 		if (!this.declared) return;
@@ -461,10 +494,17 @@ export class GoalScheduler {
 		}
 		// A producer's native report discharges the task it identifies before the
 		// host turn takes over; unidentified reports change nothing.
-		if (this.background(ctx)) this.safe(ctx, () => this.changeBackground(ctx, s => {
-			const observed = observeHostMessage(s.backgroundTasks, rawMessage, this.owner(ctx));
-			s.backgroundTasks = observed.state;
-		}));
+		if (this.background(ctx)) this.safe(ctx, () => {
+			const current = this.background(ctx);
+			if (!current) return;
+			const observed = observeHostMessage(current, rawMessage, this.owner(ctx));
+			if (observed.reported.length === 0) return;
+			this.changeBackground(ctx, s => {
+				const applied = observeHostMessage(s.backgroundTasks, rawMessage, this.owner(ctx));
+				s.backgroundTasks = applied.state;
+				this.refreshTaskWait(s);
+			});
+		});
 		// Genuine host work supersedes an old scheduling claim, but never resets used.
 		this.takeover(ctx);
 	}
@@ -477,7 +517,6 @@ export class GoalScheduler {
 			state.generation = randomUUID(); state.phase = "idle"; state.decision = undefined; state.dispatch = undefined; state.wait = undefined;
 			state.repairUsed = false; state.postTaskProgress = false;
 		}));
-		this.guardTaskDeadline(ctx);
 	}
 	settled(ctx: ExtensionContext, successful = true): void {
 		this.inRun = false;
@@ -487,8 +526,9 @@ export class GoalScheduler {
 		this.safe(ctx, () => {
 			const goal = this.core.state.goal;
 			if (!goal || goal.status !== "active" || !goal.autoContinue || !successful) return;
-			const deadline = this.taskDeadline(ctx);
-			if (deadline !== undefined && deadline <= Date.now()) { this.pause(ctx, "Wait deadline reached."); return; }
+			// Terminal evidence that never raised a message event (a pstack stop,
+			// an orphan stop) is reconciled before the settlement decides.
+			this.scanProducerRecords(ctx);
 			if (this.declared && goal.scheduler?.decision) { this.schedule(ctx); return; }
 			const s = this.state(ctx, goal);
 			// Detached work is a wait, not a disposition: sleep instead of running a
@@ -539,26 +579,42 @@ export class GoalScheduler {
 		invalidateGoalSettingsCache();
 		this.safe(ctx, () => {
 			this.core.reconcileFocusedGoalFromDisk(ctx);
+			// Terminal evidence that never raised a message event (a pstack stop,
+			// an orphan stop persisted on reload) is reconciled before deciding.
+			this.scanProducerRecords(ctx);
 			const g = this.core.state.goal;
 			if (!g || g.status !== "active" || !g.autoContinue || !g.scheduler) return;
 			let s = this.state(ctx, g);
+			if (s.phase === "waiting" && s.wait?.taskId !== undefined && outstandingTasks(s.backgroundTasks).length === 0) {
+				// The evidence settled every tracked task; the wait ends with them.
+				s = this.update(ctx, state => this.implicitReady(state)).scheduler!;
+			}
 			if (s.phase === "ready" && s.decision?.kind === "ready" && s.decision.purpose === "repair" && !this.strict(ctx, s)) {
 				s = this.update(ctx, state => this.implicitReady(state)).scheduler!;
 			}
-			const deadline = this.taskDeadline(ctx);
-			if (deadline !== undefined && deadline <= Date.now()) { this.pause(ctx, "Wait deadline reached."); return; }
-			if (!["ready", "waiting"].includes(s.phase)) { this.guardTaskDeadline(ctx); return; }
+			if (!["ready", "waiting"].includes(s.phase)) return;
 			if (budgetReached(g)) { this.pause(ctx, "Goal token budget exhausted."); return; }
 			if (!this.available(ctx, s)) { this.pause(ctx, this.allowanceReason(ctx)); return; }
 			// Recovery and repair retain the wait while changing phase to ready.
-			if (s.wait && Date.now() >= s.wait.deadline) { this.pause(ctx, "Wait deadline reached."); return; }
-			if (s.phase === "waiting" && s.wait) {
+			if (s.wait && s.wait.deadline !== undefined && Date.now() >= s.wait.deadline) { this.pause(ctx, "Wait deadline reached."); return; }
+			if (s.phase === "waiting" && s.wait && !s.wait.signalled) {
 				this.core.clearActiveAccounting();
-				// A system task wait keeps sleeping until its deadline once its one
-				// check is spent; only an explicit declared wait pauses here.
-				if (!s.wait.signalled && s.wait.remainingChecks === 0 && s.wait.taskId === undefined) { this.pause(ctx, "Wait check allowance exhausted."); return; }
-				if (!s.wait.signalled && (s.wait.nextCheckAt === undefined || s.wait.nextCheckAt > Date.now())) {
-					const due = Math.min(s.wait.deadline, s.wait.nextCheckAt ?? Infinity);
+				if (s.wait.taskId !== undefined) {
+					// An event-driven task wait: no manufactured deadline or check. The
+					// only bound is a deadline a verified producer contract declared at launch. Only pstack tasks have session records to
+					// re-read (a stop notice never raises a message event); the re-read
+					// backs off so an idle wait costs nothing.
+					const bound = s.wait.deadline !== undefined ? s.wait.deadline - Date.now() : Infinity;
+					if (outstandingTasks(s.backgroundTasks).some(t => t.producer === "structured:agent")) {
+						this.later(ctx, Math.min(this.nextPollDelay(), bound), () => this.schedule(ctx));
+						return;
+					}
+					if (s.wait.deadline !== undefined) this.later(ctx, bound, () => this.schedule(ctx));
+					return;
+				}
+				if (s.wait.remainingChecks === 0) { this.pause(ctx, "Wait check allowance exhausted."); return; }
+				if (s.wait.nextCheckAt === undefined || s.wait.nextCheckAt > Date.now()) {
+					const due = Math.min(s.wait.deadline ?? Infinity, s.wait.nextCheckAt ?? Infinity);
 					this.later(ctx, due - Date.now(), () => this.schedule(ctx)); return;
 				}
 			}
@@ -579,29 +635,18 @@ export class GoalScheduler {
 			this.update(ctx, (s, g) => {
 				if (s.generation !== generation) throw new Error("Scheduling generation changed.");
 				if (g.status !== "active" || !g.autoContinue || budgetReached(g) || !this.available(ctx, s)) throw new Error(this.allowanceReason(ctx));
-				const deadline = this.taskDeadline(ctx);
-				if (deadline !== undefined && Date.now() >= deadline) throw new Error("Wait deadline reached.");
-				if (s.wait && Date.now() >= s.wait.deadline) throw new Error("Wait deadline reached.");
+				if (s.wait && s.wait.deadline !== undefined && Date.now() >= s.wait.deadline) throw new Error("Wait deadline reached.");
 				if (s.phase === "ready" && s.decision?.kind === "ready" && s.decision.purpose === "repair" && !this.strict(ctx, s)) this.implicitReady(s);
-				let taskCheck: NonNullable<GoalSchedulerState["dispatch"]>["taskCheck"];
 				let kind = s.phase === "ready" && s.decision?.kind === "ready" ? s.decision.purpose : undefined;
 				if (s.phase === "waiting" && s.wait) {
 					if (s.wait.signalled) kind = "wake";
 					else if (s.wait.nextCheckAt !== undefined && s.wait.nextCheckAt <= Date.now() && (s.wait.remainingChecks ?? 0) > 0) {
 						kind = "check";
 						s.wait.remainingChecks!--;
-						if (s.wait.taskId !== undefined && s.backgroundTasks) {
-							// One dispatch spends every due task check; the projection
-							// follows the canonical budgets.
-							taskCheck = { targets: outstandingTasks(s.backgroundTasks).filter(t => t.wait?.remainingChecks === 1 && t.wait.checkAt <= Date.now()).map(t => ({ producer: t.producer, taskId: t.taskId, receiptId: t.receiptId })) };
-							s.backgroundTasks = consumeDueChecks(s.backgroundTasks, Date.now());
-							const projection = projectWait(s.backgroundTasks);
-							if (projection) { s.wait.remainingChecks = projection.remainingChecks; s.wait.nextCheckAt = projection.nextCheckAt; }
-						}
 					}
 				}
 				if (!kind) throw new Error("No scheduling decision authorizes this checkpoint.");
-				s.used++; s.phase = "claimed"; s.dispatch = { id: randomUUID(), kind, claimedAt: Date.now(), ...(taskCheck ? { taskCheck } : {}) };
+				s.used++; s.phase = "claimed"; s.dispatch = { id: randomUUID(), kind, claimedAt: Date.now() };
 				s.postTaskProgress = false;
 				if (kind === "repair") s.repairUsed = true;
 				else if (kind !== "recovery") s.repairUsed = false;
