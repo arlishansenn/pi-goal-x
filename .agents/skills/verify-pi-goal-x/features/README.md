@@ -1,12 +1,20 @@
 # pi-goal-x feature map
 
-Index of user-facing features verified on the real surface (pi RPC mode with the extension loaded). Each file is self-contained: user-POV path, drive script, and the observable end state that proves the feature. Read `../SKILL.md` first for launch, doctor, and evidence rules.
+Read ../SKILL.md before driving. Every scenario runs in scratch state with a doctor, transcript, snapshots and owned-process cleanup.
 
-| Feature | File | Proves |
-| --- | --- | --- |
-| Direct goal creation | [goal-direct-creation.md](goal-direct-creation.md) | `/goal-direct` writes a v3 goal file, appends `goal_created`, focuses in-session, and the pool survives process restart |
-| Goal list and focus | [goal-list-and-focus.md](goal-list-and-focus.md) | `/goal-list` matches disk, `/goal-focus` selects without touching files, `/goal-unfocus` is session-only |
-| Cancelled clear is a no-op | [goal-clear-cancel-noop.md](goal-clear-cancel-noop.md) | `/goal-clear` cancelled at the confirm dialog changes nothing, byte for byte |
-| Pause and health check | [goal-pause-status-health.md](goal-pause-status-health.md) | `/goal-pause` persists `paused` to the file and ledger; `/goal-status health` reports coherently |
+## Goal commands
 
-Not yet mapped: guided drafting (`/goal` questionnaire dialogs), task tools, the completion auditor (needs a model), the TUI widget/overlay/Esc keys (tmux recipe in `../SKILL.md`).
+- [Direct creation and restart](goal-direct-creation.md).
+- [List, focus and unfocus](goal-list-and-focus.md).
+- [Cancelled clear](goal-clear-cancel-noop.md).
+- [Pause and read-only health](goal-pause-status-health.md).
+
+These four share `../scenarios/commands.jsonl` with `maxAutonomousRuns:0` to isolate commands from model continuation.
+
+## Background lifecycle
+
+- [Background waits and terminal reports](background-waits-and-reports.md).
+- [Saved-session reload](reload-background-waits.md).
+- [Confirmed legacy task recovery](confirmed-task-recovery.md).
+
+Receipt replay tests the consumer protocol. Actual producer execution, persisted historical recovery replay and controlled-clock edge tests are separate evidence categories. Guided drafting, task tools and completion auditing remain unmapped; do not imply this map proves them.
