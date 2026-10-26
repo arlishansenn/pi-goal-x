@@ -1,0 +1,9 @@
+{"send":{"type":"prompt","message":"/goal-direct Call agent exactly once with empty arguments. This is a receipt replay verification, no actual child runs. After launch end the turn without polling or other tools. On the later pstack-agent terminal report, write its status to result.txt using write, then call update_goal status paused reason Verification-finished. Never launch another task."}}
+{"waitForGoal":{"scheduler.phase":"waiting","scheduler.wait.deadline":null,"scheduler.wait.nextCheckAt":null,"scheduler.backgroundTasks.tasks.0.hostReported":false},"timeoutMs":120000}
+{"snap":"waiting"}
+{"send":{"type":"prompt","message":"/goal-refresh"}}
+{"waitForGoal":{"scheduler.phase":"waiting"}}
+{"snap":"refreshed"}
+{"send":{"type":"prompt","message":"/verify-report completed"}}
+{"waitForGoal":{"status":"paused","scheduler.backgroundTasks.tasks.0.hostReported":true,"scheduler.backgroundTasks.tasks.0.outcome":"completed"},"timeoutMs":120000}
+{"snap":"reported"}

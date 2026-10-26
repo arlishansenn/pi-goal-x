@@ -1,0 +1,18 @@
+{"send":{"type":"prompt","message":"/goal-direct Verify command lifecycle"}}
+{"waitForGoal":{"status":"active"}}
+{"snap":"created"}
+{"send":{"type":"prompt","message":"/goal-list"}}
+{"send":{"type":"prompt","message":"/goal-pause"}}
+{"waitForGoal":{"status":"paused"}}
+{"snap":"paused"}
+{"send":{"type":"prompt","message":"/goal-status health"}}
+{"snap":"health"}
+{"send":{"type":"prompt","message":"/goal-focus"}}
+{"snap":"focused"}
+{"send":{"type":"prompt","message":"/goal-unfocus"}}
+{"snap":"unfocused"}
+{"send":{"type":"prompt","message":"/goal-focus"}}
+{"snap":"before-clear"}
+{"autoDialog":{"confirm":{"confirmed":false}}}
+{"send":{"type":"prompt","message":"/goal-clear"}}
+{"snap":"after-clear"}

@@ -1,95 +1,72 @@
 ---
 name: verify-pi-goal-x
-description: "Drives the real pi coding-agent with the pi-goal-x extension loaded (RPC mode over stdio) to verify goal lifecycle behavior end to end. Use when a change touches extensions/ or scripts/ and you need proof on the real surface, or when asked to verify, reproduce, or dogfood any /goal command, goal tool, dashboard, or audit flow."
+description: "Drive pi-goal-x through real pi RPC or its terminal UI. Use to verify goal commands, background waits, pstack terminal reports, session reload and confirmed legacy-task recovery. Keep real producer, receipt replay and controlled-clock evidence separate."
 ---
 
 # Verify pi-goal-x
 
-pi-goal-x is a pi coding-agent extension. The real surface is a pi session with the extension loaded. This skill drives that session headlessly through pi's RPC mode, exercises commands the way a user would, and captures RPC transcript plus on-disk goal state as evidence. No model calls and no npm install are needed for command-only verification.
-
 ## Launch
 
-One-shot print mode runs a single command and exits. It writes goal state but prints nothing; use it only for setup steps.
+Run from the checkout root. The executable helper resolves `extensions/goal.ts` relative to itself. It disables ambient extensions, skills, prompt templates and MCP. `pi` must be on PATH. TypeScript loads through pi's runtime; model-backed scenarios additionally need an authenticated model.
 
 ```bash
-pi -ne -e /Users/admin/project/pi-goal-x/extensions/goal.ts --print "/goal-direct <objective>"
+V=.agents/skills/verify-pi-goal-x
+node "$V/rpc-drive.mjs" doctor /tmp/pgx-proof-doctor-new
+PI_GOAL_VERIFY_SETTINGS='{"maxAutonomousRuns":0}' \
+  node "$V/rpc-drive.mjs" run auto "$V/scenarios/commands.jsonl" /tmp/pgx-proof-commands-new
 ```
 
-The interactive harness is RPC mode. Always run it in a throwaway project directory: goal state lives in `<cwd>/.pi/goals/` and is real user data in any other directory.
-
-```bash
-WORK=$(mktemp -d /tmp/pgx-verify.XXXXXX)
-cd "$WORK" && pi --mode rpc --no-session -ne -e /Users/admin/project/pi-goal-x/extensions/goal.ts
-```
-
-- `-ne` disables every discovered/configured extension so only this extension answers. `-e <path>` loads it for one invocation without touching any settings file.
-- pi loads the TypeScript through jiti; the repo's empty `node_modules` is fine (verified).
-- Ready signal: the process stays alive and emits JSONL on stdout. It is ready when `{"id":"...","type":"get_state"}` gets a `success: true` response.
-- Teardown: kill the pi process you spawned (`rpc-drive.mjs` does this). Never kill by name; `pgrep -f "pi-goal-x/extensions/goal.ts"` may match the user's own sessions.
-- Two instances run side by side in separate scratch directories (locks and state are per-directory). Never point two drives at the same directory.
+`auto` creates and removes an owned scratch project. A supplied directory must be an explicitly created verification project, never the user's checkout or active goal directory. The helper leaves supplied directories for restart tests. It always terminates only its own child pi. Two runs may coexist only with different project, session and evidence directories.
 
 ## Doctor
 
-Run before anything looks off, read-only:
+Every `run` first sends `get_state` and `/goal-status health` to the same instance it will drive. Both must return successful correlated responses and goal UI output must appear. A surprising failure requires a fresh instance and a new evidence directory; do not continue on a wedged process.
 
-```bash
-node /Users/admin/project/pi-goal-x/.agents/skills/verify-pi-goal-x/rpc-drive.mjs \
-  doctor <evidence-dir>
-```
-
-The helper creates its own scratch dir, sends `/goal-status health`, and passes when the `prompt` response has `disposition: "handled"` and at least one `extension_ui_request` record appeared (only our extension emits UI under `-ne`). Failure means the extension did not load: check `pi --version`, the repo path, and stderr in `<evidence-dir>/rpc-transcript.jsonl`.
+A separate `doctor` is a launch smoke check, not a replacement for each run's own doctor. It creates no goal, calls no model and removes its scratch project. Evidence remains.
 
 ## Drive
 
-Use `rpc-drive.mjs`. A drive script is JSONL with four step kinds:
+The helper consumes JSONL steps. `send` waits for the matching response and fails on rejected commands. `autoDialog` answers dialogs immediately; an unconfigured dialog cancels and fails the drive. A prompt response means accepted, not completed. Use `waitForGoal` or `waitForRecord` for asynchronous work.
 
 ```json
-{"autoDialog": {"confirm": {"confirmed": false}, "select": {"cancelled": true}, "input": {"cancelled": true}}}
-{"send": {"id": "c1", "type": "prompt", "message": "/goal-list"}}
-{"wait": 1500}
-{"snap": "after-goal-direct"}
+{"autoDialog":{"confirm":{"confirmed":false}}}
+{"send":{"type":"prompt","message":"/goal-clear"}}
+{"waitForGoal":{"status":"paused"},"timeoutMs":15000}
+{"snap":"after-command"}
 ```
 
-- `send` writes any RPC record to pi (`prompt`, `get_state`, ...).
-- `autoDialog` installs answers for blocking dialogs. pi blocks until each dialog gets an `extension_ui_response`; set the policy BEFORE the command that opens the dialog. Respond with the full response body, e.g. `{"confirmed": false}` or `{"value": "Option A"}` or `{"cancelled": true}`.
-- `wait` sleeps milliseconds (commands are asynchronous; the `response` record means accepted, not finished).
-- `snap` copies the whole `.pi/goals/` tree into the evidence dir under a label.
-- Command output is observable as `extension_ui_request` records: `notify` carries the printed text (e.g. `/goal-list` output), `setStatus` carries the status line (e.g. `goal: unfocused [1 open]`), `setWidget` the dashboard payload.
+Dot paths in conditions compare literal values. `null` means absent or null. Snapshot labels are unique. Each evidence directory must be new, so runs cannot overwrite or mingle transcripts.
 
-Run a drive:
+Environment options are verification-only launch controls, not product settings:
 
-```bash
-node /Users/admin/project/pi-goal-x/.agents/skills/verify-pi-goal-x/rpc-drive.mjs \
-  run <workdir|auto> <drive-script.jsonl> <evidence-dir>
-```
+- `PI_GOAL_VERIFY_SETTINGS` writes JSON project settings only for `auto` scratch projects. Use `maxAutonomousRuns:0` for command-only checks to prevent accidental model work. For a supplied scratch project, create its settings explicitly before launch.
+- `PI_GOAL_VERIFY_EXTENSIONS` is a JSON array of extra extension paths. Use a real producer for integration proof or the clearly labeled `receipt-producer.ts` for notification-contract replay.
+- `PI_GOAL_VERIFY_SESSION_DIR` enables persistent verification sessions in the specified scratch directory.
+- `PI_GOAL_VERIFY_SESSION` opens one saved verification session for same-session reload. Do not point it at a user's real session. Without either option, `--no-session` makes each run unfocused on restart.
 
-`auto` creates a fresh scratch dir. The helper tees every stdout record (with receive timestamps) to `<evidence-dir>/rpc-transcript.jsonl`, kills pi at the end, and prints record counts.
-
-The TUI surface (Goal Beacon widget rendering, Esc pause, Ctrl+Shift+T overlay) is not visible in RPC mode. For those, run the same launch line without `--mode rpc` inside a tmux pane in the scratch dir and drive keys (`tmux send-keys`), capturing `tmux capture-pane -p`. Same scratch-dir rule applies.
+The four basic command features share `scenarios/commands.jsonl`. The background recipe is `scenarios/background.jsonl`. Read the feature map before choosing additional steps.
 
 ## Evidence
 
-A proof needs all three, captured per feature run:
+Each run records its launch options, sent actions, received JSONL, stderr and failures in `rpc-transcript.jsonl`. It copies the drive script, snapshots `.pi/goals/` under `snaps/<label>/`, and records owned-process teardown in `cleanup.json`. Goal markdown begins with JSON followed by `# Goal Prompt`; do not parse the entire file with `JSON.parse`.
 
-1. The action: the drive script plus the request/response records in `<evidence-dir>/rpc-transcript.jsonl` (`disposition: "handled"` for each command).
-2. The resulting state: `<evidence-dir>/snaps/<label>/...` copies of `.pi/goals/` (goal markdown, `goal_events.jsonl`, lock dir state). Key files: `active_goal_<timestamp>_<id>.md` (v3 JSON record) and `goal_events.jsonl` (append-only ledger).
-3. Side-effect checks beyond the visible: hash the goal file and ledger before and after a no-op claim (`shasum -a 256`), count ledger lines before/after, and diff snapshot trees.
+Prove both action and side effect. Compare goal identity/status, task `hostReported/outcome`, absence or exact value of a declared deadline, ledger events, and recovery backup bytes. `goal_focused` is a legitimate ledger mutation. Do not assume focus/unfocus is a directory-wide no-op. Check cancel on a paused, quiescent goal and assert exact bytes.
 
-Standards: exercise the real user path (slash commands through `prompt`), never write goal files directly to set up state; use `/goal-direct` for setup. Mocks are unnecessary: the extension's external boundary (the auditor's model call) is only reached by `update_goal complete`, which the feature map drives with the auditor disabled or leaves to manual runs. Evidence survives cleanup; it lives under `/tmp/pi-goal-x-verify-evidence/<timestamp>-<label>/` until the machine restarts (copy it into the repo or an issue when it must persist).
+Distinguish evidence types in every report:
+
+- **Real producer.** Load the actual producer, run its child and retain native notifications plus child/session records. Historical issue #10 evidence is in `experiments/issue-10/`; it is not a new maintenance run.
+- **Receipt replay.** `receipt-producer.ts` emits structural launch/terminal records through real pi, but starts no child. Its passing result proves the consumer protocol only.
+- **Controlled clock.** Product tests prove eleven-minute and deadline edges without elapsed wall time. Reference their current results separately; do not call them live-runtime proof.
+- **Application screenshot.** Run pi in an isolated terminal and capture that application window, together with terminal text and session records. A screenshot of a custom HTML evidence page is not an application screenshot.
+
+Keep evidence outside scratch workdirs, for example `/tmp/pgx-map-maintenance/<run>/`. `/tmp` is not durable across restarts; copy required proof to a retained location before handoff. Never capture unrelated desktop windows or credentials.
 
 ## Cleanup
 
-`rpc-drive.mjs` kills the pi process it spawned and leaves everything else. After a manual run:
-
-```bash
-rm -rf "$WORK"            # the scratch project dir this run created
-```
-
-Do not delete the evidence dir. Do not run cleanup against any directory that existed before the drive; the skill never writes outside `$WORK` and the evidence dir.
+The helper terminates its exact child pid and removes only automatically created projects. Inspect `cleanup.json` and verify the transcript and snapshots still exist. For supplied scratch projects, remove only paths you explicitly created after the last restart/recovery drive. Producer-created children must also exit; the real producer's shutdown contract must be observed rather than assumed.
 
 ## Helpers
 
-- `rpc-drive.mjs` — the launcher/driver above. `node rpc-drive.mjs` with no args prints usage. Invocations shown in Doctor and Drive.
-- `features/` — the feature map. `features/README.md` indexes it; each file gives the user-POV steps, the drive script, and the observable end state for one feature. A proof that drives one convenient entry point is incomplete when the map lists others.
+`rpc-drive.mjs` is executable and supports `doctor` and `run` as above. `receipt-producer.ts` is a pi extension scaffold, loaded only with explicit `-e`; it registers `agent` and `/verify-report completed|failed|stopped` and never launches a real child.
 
-After app changes, `/skill:maintain-verification-skill` keeps the map honest.
+`features/README.md` indexes maintained feature recipes. Product failures belong in a separate report, never a documentation change that makes a broken behavior look correct. Use `/skill:maintain-verification-skill` after behavior changes.
