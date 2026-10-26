@@ -1,0 +1,4 @@
+
+> pi-goal-x@0.32.3 check
+> tsc --noEmit
+
