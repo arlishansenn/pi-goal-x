@@ -29,7 +29,7 @@ import { effectiveSettingsReport, invalidateGoalSettingsCache, loadGoalSettingsF
 import { invalidateGoalPoolCache, mergeGoalPromptFromDisk, readActiveGoalPool } from "./storage/goal-files.ts";
 import { nowIso, type GoalMode, type GoalRecord } from "./goal-record.ts";
 import { clearGoalDrafting, hasActiveDraft, startGoalDrafting } from "./goal-drafting.ts";
-import { formatRecoveryReport, runRecoveryReport, runRecoveryRepair } from "./goal-recovery.ts";
+import { backupGoalFileForRecovery, formatRecoveryReport, runRecoveryReport, runRecoveryRepair, verifyRecoverableTasks, type VerifiedTaskReceipt } from "./goal-recovery.ts";
 import { formatCheckpointHealthReport, readSessionCheckpointHealth } from "./goal-session-health.ts";
 
 export interface GoalRefreshState {
@@ -197,7 +197,72 @@ export function registerGoalCommands(core: GoalCore): void {
 		core.replaceGoal({ objective, autoContinue: true, sisyphus: mode === "sisyphus" }, ctx, true, verificationContract);
 	}
 
+	/**
+	 * Settle legacy background tasks whose launching session's latest
+	 * pstack-agents record is terminal. Confirmation first, goal-file backup of
+	 * the exact pre-write authority, one auditable ledger event per settlement
+	 * actually applied, and the goal's lifecycle is untouched. The confirmation
+	 * window can race a resume, a focus change, or a producer record advancing,
+	 * so the records are re-verified inside the mutation and only a task whose
+	 * full tuple (producer, taskId, receiptId, session, outcome, evidence entry)
+	 * was shown in the confirmation settles.
+	 */
+	async function runGoalRecoveryTasks(ctx: ExtensionContext): Promise<void> {
+		core.reconcileFocusedGoalFromDisk(ctx);
+		const goal = core.state.goal;
+		if (!goal) { ctx.ui.notify("No goal is focused.", "warning"); return; }
+		const tracked = goal.scheduler?.backgroundTasks;
+		if (!tracked || tracked.tasks.length === 0) { ctx.ui.notify("goal-recovery tasks: this goal tracks no background tasks.", "info"); return; }
+		const sessionDir = (ctx.sessionManager as { getSessionDir?: () => string | undefined }).getSessionDir?.();
+		const verified = verifyRecoverableTasks(tracked.tasks, tracked.scope?.sessionId, sessionDir);
+		if (verified.length === 0) { ctx.ui.notify("goal-recovery tasks: no verified terminal session records found; nothing changed.", "info"); return; }
+		const confirmed = await ctx.ui.confirm(
+			`Settle ${verified.length} background task(s) from their terminal session records?`,
+			`The goal file is backed up to .pi/goals/.recovery-backup first and each settlement is recorded in the ledger. The goal's lifecycle (status, owner, scheduling) is not changed.`,
+		);
+		if (!confirmed) { ctx.ui.notify("goal-recovery tasks: cancelled — nothing changed.", "info"); return; }
+		const tuple = (r: VerifiedTaskReceipt) => JSON.stringify([r.producer, r.taskId, r.receiptId, r.sessionId, r.outcome, r.evidenceEntryId]);
+		const confirmedTuples = new Set(verified.map(tuple));
+		let applied: VerifiedTaskReceipt[] = [];
+		let stamp = "";
+		let result;
+		try {
+			result = core.goalService.apply(ctx, {
+				expectedGoalId: goal.id,
+				mutate: g => {
+					const scheduler = g.scheduler;
+					const state = scheduler?.backgroundTasks;
+					if (!scheduler || !state) throw new Error("The goal no longer tracks background tasks; nothing was changed.");
+					const current = verifyRecoverableTasks(state.tasks, state.scope?.sessionId, sessionDir);
+					const scopeSession = state.scope?.sessionId;
+					const settled: VerifiedTaskReceipt[] = [];
+					const nextTasks = state.tasks.map(task => {
+						const sessionId = task.scope?.sessionId ?? scopeSession;
+						const receipt = current.find(v => confirmedTuples.has(tuple(v)) && v.taskId === task.taskId && v.producer === task.producer && v.receiptId === task.receiptId && v.sessionId === sessionId);
+						if (!receipt || task.hostReported) return task;
+						settled.push(receipt);
+						return { ...task, hostReported: true, outcome: receipt.outcome };
+					});
+					if (settled.length === 0) throw new Error("The confirmed tasks or their session records changed; nothing was changed.");
+					// The backup copies the exact file this mutation is about to replace.
+					stamp = backupGoalFileForRecovery(ctx, g);
+					applied = settled;
+					scheduler.backgroundTasks = { ...state, tasks: nextTasks };
+					return { ...g, scheduler };
+				},
+				ledger: () => applied.map(receipt => ({ type: "background_task_recovered" as const, goalId: goal.id, ...receipt, at: nowIso() })),
+			});
+		} catch (error) {
+			ctx.ui.notify(`goal-recovery tasks: nothing changed. ${error instanceof Error ? error.message : String(error)}`, "warning");
+			return;
+		}
+		if (!result.ok) { ctx.ui.notify(`goal-recovery tasks: ${result.message}`, "warning"); return; }
+		core.updateUI(ctx);
+		ctx.ui.notify(`goal-recovery tasks: settled ${applied.length} task(s) from their terminal session records.\nBackup: ${stamp}`, "info");
+	}
+
 	async function runGoalRecovery(rawArgs: string, ctx: ExtensionContext): Promise<void> {
+		if (/^tasks$/i.test(rawArgs)) { await runGoalRecoveryTasks(ctx); return; }
 		const report = runRecoveryReport(ctx);
 		if (/^repair$/i.test(rawArgs)) {
 			const result = await runRecoveryRepair(ctx, report, async () => {
@@ -767,7 +832,7 @@ export function registerGoalCommands(core: GoalCore): void {
 		},
 	});
 	pi.registerCommand("goal-recovery", {
-		description: "Read-only storage/recovery report (malformed goal files, malformed ledger lines, stale locks, orphaned snapshot data). Append \"repair\" to remove stale locks and refresh the pool snapshot after confirmation (with backup).",
+		description: "Read-only storage/recovery report (malformed goal files, malformed ledger lines, stale locks, orphaned snapshot data). Append \"repair\" to remove stale locks and refresh the pool snapshot after confirmation (with backup), or \"tasks\" to settle background tasks from their launching session's terminal records after confirmation (with backup).",
 		handler: async (rawArgs, ctx) => {
 			await runGoalRecovery((rawArgs ?? "").trim(), ctx);
 		},
